@@ -7,10 +7,28 @@ const { Stagehand } = require("@browserbasehq/stagehand");
 const app = express();
 app.use(express.json());
 
-// Simple health check endpoint
-app.get("/", (req, res) => {
-  res.send("Stagehand service is running");
+app.post("/run", async (req, res) => {
+  // Debug info about what @browserbasehq/stagehand gives us
+  try {
+    console.log("Stagehand typeof:", typeof Stagehand);
+    console.log("Stagehand keys:", Object.keys(Stagehand || {}));
+    console.log("Stagehand value:", Stagehand);
+
+    res.json({
+      success: false,
+      message: "Debug info for Stagehand export",
+      typeofStagehand: typeof Stagehand,
+      keys: Object.keys(Stagehand || {}),
+    });
+  } catch (err) {
+    console.error("Error in debug /run:", err);
+    res.status(500).json({
+      success: false,
+      error: err.message || "Unknown error",
+    });
+  }
 });
+
 
 /**
  * Main endpoint Lovable will call.
