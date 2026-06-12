@@ -8,26 +8,36 @@ const app = express();
 app.use(express.json());
 
 app.post("/run", async (req, res) => {
-  // Debug info about what @browserbasehq/stagehand gives us
   try {
     console.log("Stagehand typeof:", typeof Stagehand);
     console.log("Stagehand keys:", Object.keys(Stagehand || {}));
-    console.log("Stagehand value:", Stagehand);
+
+    const instance = new Stagehand({
+      apiKey: process.env.BROWSERBASE_API_KEY,
+    });
+
+    const proto = Object.getPrototypeOf(instance);
+    const methodNames = Object.getOwnPropertyNames(proto).filter(
+      (name) => name !== "constructor"
+    );
+
+    console.log("Stagehand instance methods:", methodNames);
 
     res.json({
       success: false,
-      message: "Debug info for Stagehand export",
+      message: "Debug info for Stagehand instance",
       typeofStagehand: typeof Stagehand,
-      keys: Object.keys(Stagehand || {}),
+      instanceMethods: methodNames,
     });
   } catch (err) {
-    console.error("Error in debug /run:", err);
+    console.error("Error in debug /run instance:", err);
     res.status(500).json({
       success: false,
       error: err.message || "Unknown error",
     });
   }
 });
+
 
 
 /**
