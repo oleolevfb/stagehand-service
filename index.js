@@ -31,7 +31,9 @@ app.post("/run", async (req, res) => {
     // Create Stagehand agent
     agent = new Stagehand({
       apiKey: process.env.BROWSERBASE_API_KEY,
+      env: "node", // tell Stagehand we're in a Node environment
     });
+
 
     // Initialize the agent
     await agent.init();
