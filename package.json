@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@browserbasehq/stagehand": "^0.2.0",
+    "@browserbasehq/stagehand": "latest",
     "express": "^4.19.2",
     "dotenv": "^16.4.5"
   }
