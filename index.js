@@ -16,11 +16,13 @@ app.get("/", (req, res) => {
  * Main endpoint Lovable will call.
  * It expects JSON like:
  * {
- *   "instructions": "Click the login button and take a screenshot.",
+ *   "instructions": "Get page title",
  *   "url": "https://example.com"
  * }
  */
 app.post("/run", async (req, res) => {
+  console.log("Received /run request:", req.body);
+
   const { instructions, url } = req.body || {};
 
   if (!instructions) {
@@ -45,6 +47,7 @@ app.post("/run", async (req, res) => {
       // You can add other Stagehand options here if needed
     });
 
+    // Launch a browser via Browserbase
     browser = await stagehand.launch();
     const page = await browser.newPage();
 
@@ -52,12 +55,10 @@ app.post("/run", async (req, res) => {
       await page.goto(url, { waitUntil: "networkidle0" });
     }
 
-    // This is where you'd define what "instructions" does.
-    // For now, we’ll just return the current page title and URL as an example.
+    // Simple example behavior: return the page title and URL
     const pageTitle = await page.title();
     const pageUrl = page.url();
 
-    // You can expand this to do more complex automation later.
     const result = {
       message: "Stagehand ran successfully",
       instructionsReceived: instructions,
@@ -87,3 +88,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Stagehand service listening on port ${PORT}`);
 });
+
