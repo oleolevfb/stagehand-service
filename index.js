@@ -8,35 +8,69 @@ const app = express();
 app.use(express.json());
 
 app.post("/run", async (req, res) => {
-  try {
-    console.log("Stagehand typeof:", typeof Stagehand);
-    console.log("Stagehand keys:", Object.keys(Stagehand || {}));
+  const { instructions, url } = req.body || {};
+  console.log("Received /run request:", req.body);
 
-    const instance = new Stagehand({
+  if (!instructions) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing 'instructions' in request body",
+    });
+  }
+
+  if (!process.env.BROWSERBASE_API_KEY) {
+    return res.status(500).json({
+      success: false,
+      error: "BROWSERBASE_API_KEY not set on server",
+    });
+  }
+
+  let agent;
+
+  try {
+    // Create Stagehand agent
+    agent = new Stagehand({
       apiKey: process.env.BROWSERBASE_API_KEY,
     });
 
-    const proto = Object.getPrototypeOf(instance);
-    const methodNames = Object.getOwnPropertyNames(proto).filter(
-      (name) => name !== "constructor"
-    );
+    // Initialize the agent
+    await agent.init();
 
-    console.log("Stagehand instance methods:", methodNames);
+    // Go to the URL if provided, otherwise use example.com
+    const targetUrl = url || "https://example.com";
+    await agent.connectURL(targetUrl);
 
-    res.json({
-      success: false,
-      message: "Debug info for Stagehand instance",
-      typeofStagehand: typeof Stagehand,
-      instanceMethods: methodNames,
+    // Run an extraction based on the instructions
+    const extraction = await agent.extract({
+      instructions,
     });
+
+    // Build a simple response – we’ll include the raw extraction result
+    const result = {
+      message: "Stagehand ran successfully",
+      instructionsReceived: instructions,
+      urlVisited: targetUrl,
+      extraction,
+    };
+
+    res.json({ success: true, result });
   } catch (err) {
-    console.error("Error in debug /run instance:", err);
+    console.error("Error in /run:", err);
     res.status(500).json({
       success: false,
       error: err.message || "Unknown error",
     });
+  } finally {
+    if (agent) {
+      try {
+        await agent.close();
+      } catch (closeErr) {
+        console.error("Error closing Stagehand agent:", closeErr);
+      }
+    }
   }
 });
+
 
 
 
