@@ -1,0 +1,14 @@
+{
+  "name": "stagehand-service",
+  "version": "1.0.0",
+  "description": "Browserbase Stagehand service for Lovable on Render",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "^0.2.0",
+    "express": "^4.19.2",
+    "dotenv": "^16.4.5"
+  }
+}
