@@ -59,8 +59,7 @@ app.post("/run", async (req, res) => {
 
     // Go to the requested URL, or a default
     const targetUrl = url || "https://example.com";
-    await page.goto(targetUrl, { waitUntil: "networkidle0" });
-
+    await page.goto(targetUrl);
     // Run an extraction using the provided instructions
     const extractResult = await stagehand.extract(instructions);
 
