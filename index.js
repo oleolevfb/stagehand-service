@@ -44,7 +44,6 @@ app.post("/run", async (req, res) => {
     // Create Stagehand instance, using Browserbase
     stagehand = new Stagehand({
       env: "BROWSERBASE",
-      apiKey: process.env.BROWSERBASE_API_KEY,
     });
 
     // Initialize Stagehand (starts session)
