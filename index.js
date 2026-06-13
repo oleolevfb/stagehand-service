@@ -75,6 +75,11 @@ app.post("/run", async (req, res) => {
     res.json({ success: true, result });
   } catch (err) {
     console.error("Error in /run:", err);
+    try {
+      console.error("Error JSON:", JSON.stringify(err, null, 2));
+    } catch (e) {
+      console.error("Could not stringify error");
+    }
 
     const details =
       err?.errors ||
@@ -88,6 +93,7 @@ app.post("/run", async (req, res) => {
       details,
     });
   } finally {
+
 
     if (stagehand) {
       try {
