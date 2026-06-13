@@ -76,11 +76,20 @@ app.post("/run", async (req, res) => {
     res.json({ success: true, result });
   } catch (err) {
     console.error("Error in /run:", err);
+
+    const details =
+      err?.errors ||
+      err?.response?.data ||
+      err?.cause ||
+      err;
+
     res.status(500).json({
       success: false,
       error: err.message || "Unknown error",
+      details,
     });
   } finally {
+
     if (stagehand) {
       try {
         await stagehand.close();
