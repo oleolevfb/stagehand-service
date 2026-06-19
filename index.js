@@ -26,7 +26,7 @@ async function runStagehand({ url, instructions }) {
     const targetUrl = url || "https://example.com";
     await page.goto(targetUrl);
 
-    const extractResult = await stagehand.extract(instructions);
+    const agent = stagehand.agent({  model: "anthropic/claude-sonnet-4-5",});const result = await agent.execute({  instruction: instructions,  maxSteps: 25,});
 
     return {
       success: true,
