@@ -26,7 +26,7 @@ async function runStagehand({ url, instructions }) {
     const targetUrl = url || "https://example.com";
     await page.goto(targetUrl);
 
-    // Wrap the original instructions to strongly preserve line breaks
+    // Wrap the instructions to strongly preserve line breaks
     const wrappedInstruction = `
 You are a browser automation agent controlling a real browser.
 
@@ -36,20 +36,21 @@ IMPORTANT RULES (DO NOT IGNORE):
 - When filling any message or textarea field, you MUST preserve all line breaks exactly as provided.
 - Do not rephrase, rewrite, or normalize whitespace.
 - Do not collapse multiple newlines into one.
-- Use direct typing or filling so that the value in the field matches the provided text exactly.
+- If the text you are given contains \\n or \\n\\n, enter it exactly as-is into the form field.
+- Prefer direct filling/typing so the field value matches the provided text exactly.
 
 Original task:
 ${instructions}
 `.trim();
 
-    // Use a cheaper/faster model suitable for UI automation
+    // Cheaper/faster model suited for UI automation
     const agent = stagehand.agent({
       model: "google/gemini-2.5-flash",
     });
 
     const agentResult = await agent.execute({
       instruction: wrappedInstruction,
-      maxSteps: 15, // you can tune this up/down
+      maxSteps: 25, // give it enough steps; Lovable expects 25–35
     });
 
     return {
@@ -82,8 +83,13 @@ ${instructions}
 }
 
 /**
- * Main endpoint Lovable will call.
+ * Main endpoint Lovable calls.
  * Lovable sends: { url, instructions, callback_url, job_id, shared_secret }
+ *
+ * Pattern:
+ *  - Respond immediately with { accepted: true, job_id }.
+ *  - Then await runStagehand(...) in the same handler.
+ *  - Always POST a final callback with job_id, success, extraction, liveSessionUrl, error.
  */
 app.post("/run", async (req, res) => {
   const { url, instructions, callback_url, job_id, shared_secret } = req.body || {};
@@ -96,47 +102,71 @@ app.post("/run", async (req, res) => {
     });
   }
 
-  // Respond immediately so Lovable's Worker returns quickly
+  // Acknowledge immediately so Lovable's Worker returns quickly
   res.json({ accepted: true, job_id });
 
-  // Run Stagehand asynchronously
-  runStagehand({ url, instructions }).then(async (result) => {
-    try {
-      if (!callback_url) return;
+  // Now, still inside the same request handler, run Stagehand and send the callback
+  try {
+    const result = await runStagehand({ url, instructions });
 
-      // Prepare a simple string "extraction" for Lovable
-      let extraction = "";
-      if (result.result && result.result.agentResult) {
-        if (typeof result.result.agentResult === "string") {
-          extraction = result.result.agentResult;
-        } else {
-          // If it's an object, send a JSON string so Lovable can inspect it
-          try {
-            extraction = JSON.stringify(result.result.agentResult);
-          } catch {
-            extraction = "";
-          }
+    if (!callback_url) {
+      console.warn("No callback_url provided; not sending callback.");
+      return;
+    }
+
+    // Build a simple "extraction" string from agentResult for Lovable
+    let extraction = "";
+    if (result.result && result.result.agentResult) {
+      if (typeof result.result.agentResult === "string") {
+        extraction = result.result.agentResult;
+      } else {
+        try {
+          extraction = JSON.stringify(result.result.agentResult);
+        } catch {
+          extraction = "";
         }
       }
-
-      await fetch(callback_url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Stagehand-Secret": shared_secret,
-        },
-        body: JSON.stringify({
-          job_id,
-          success: result.success,
-          extraction,
-          liveSessionUrl: result.result?.liveSessionUrl ?? null,
-          error: result.error ?? null,
-        }),
-      });
-    } catch (err) {
-      console.error("Error POSTing back to callback_url:", err);
     }
-  });
+
+    await fetch(callback_url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Stagehand-Secret": shared_secret,
+      },
+      body: JSON.stringify({
+        job_id,
+        success: result.success,
+        extraction,
+        liveSessionUrl: result.result?.liveSessionUrl ?? null,
+        error: result.error ?? null,
+      }),
+    });
+  } catch (err) {
+    console.error("Error during Stagehand run or callback:", err);
+
+    // Even if runStagehand or fetch throws, try to notify Lovable once
+    if (callback_url) {
+      try {
+        await fetch(callback_url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Stagehand-Secret": shared_secret,
+          },
+          body: JSON.stringify({
+            job_id,
+            success: false,
+            extraction: "",
+            liveSessionUrl: null,
+            error: err.message || "Unknown error in Render Stagehand service",
+          }),
+        });
+      } catch (e) {
+        console.error("Failed to POST error callback to Lovable:", e);
+      }
+    }
+  }
 });
 
 const PORT = process.env.PORT || 3000;
