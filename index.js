@@ -1,5 +1,3 @@
-// index.js
-
 require("dotenv").config();
 const express = require("express");
 const { Stagehand } = require("@browserbasehq/stagehand");
@@ -7,58 +5,55 @@ const { Stagehand } = require("@browserbasehq/stagehand");
 const app = express();
 app.use(express.json());
 
-// Simple health check endpoint
-app.get("/", (req, res) => {
-  res.send("Stagehand service is running");
-});
+app.get("/", (_req, res) => res.send("Stagehand service is running"));
 
-// Helper: run Stagehand once and return a result
 async function runStagehand({ url, instructions }) {
   let stagehand;
   try {
-    stagehand = new Stagehand({
-      env: "BROWSERBASE",
-    });
-
+    stagehand = new Stagehand({ env: "BROWSERBASE" });
     await stagehand.init();
 
     const page = stagehand.context.pages()[0];
     const targetUrl = url || "https://example.com";
-    await page.goto(targetUrl);
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
 
-    // Wrap the instructions to strongly preserve line breaks
     const wrappedInstruction = `
 You are a browser automation agent controlling a real browser.
 
-Your main task is described below. Follow it carefully to fill and submit forms.
+Your job is to fill out and SUBMIT the contact form on this page.
 
-IMPORTANT RULES (DO NOT IGNORE):
-- When filling any message or textarea field, you MUST preserve all line breaks exactly as provided.
-- Do not rephrase, rewrite, or normalize whitespace.
-- Do not collapse multiple newlines into one.
-- If the text you are given contains \\n or \\n\\n, enter it exactly as-is into the form field.
-- Prefer direct filling/typing so the field value matches the provided text exactly.
+HARD RULES:
+- Preserve all line breaks in any message/textarea field exactly as provided. Do not rephrase, rewrite, or collapse whitespace. If the text contains \\n or \\n\\n, type it exactly as-is.
+- You MUST fill every required field before submitting.
+- You MUST click the submit/send button at the end.
+- After submitting, WAIT for and OBSERVE the confirmation: a thank-you message, success banner, redirect, or any visible change confirming the form was sent.
+- Only stop once submission is confirmed (or it is clearly impossible, e.g. captcha you cannot solve).
+- Report in your final message whether the form was submitted successfully and quote any confirmation text you saw.
 
 Original task:
 ${instructions}
 `.trim();
 
-    // Cheaper/faster model suited for UI automation
-    const agent = stagehand.agent({
-      model: "google/gemini-2.5-flash",
-    });
+    const agent = stagehand.agent({ model: "google/gemini-2.5-flash" });
 
     const agentResult = await agent.execute({
       instruction: wrappedInstruction,
-      maxSteps: 25, // give it enough steps; Lovable expects 25–35
+      maxSteps: 35,
     });
+
+    let finalUrl = "";
+    let pageText = "";
+    try { finalUrl = page.url(); } catch {}
+    try { pageText = (await page.locator("body").innerText()).slice(0, 2000); } catch {}
 
     return {
       success: true,
       result: {
-        message: "Stagehand agent ran successfully",
+        message: "Stagehand agent finished",
         instructionsReceived: instructions,
         urlVisited: targetUrl,
+        finalUrl,
+        pageText,
         agentResult,
         liveSessionUrl: `https://browserbase.com/sessions/${stagehand.browserbaseSessionID}`,
       },
@@ -66,74 +61,48 @@ ${instructions}
     };
   } catch (err) {
     console.error("Error in runStagehand:", err);
-    return {
-      success: false,
-      result: null,
-      error: err.message || "Unknown error",
-    };
+    return { success: false, result: null, error: err.message || "Unknown error" };
   } finally {
-    if (stagehand) {
-      try {
-        await stagehand.close();
-      } catch (e) {
-        console.error("Error closing Stagehand:", e);
-      }
-    }
+    if (stagehand) { try { await stagehand.close(); } catch (e) { console.error(e); } }
   }
 }
 
-/**
- * Main endpoint Lovable calls.
- * Lovable sends: { url, instructions, callback_url, job_id, shared_secret }
- *
- * Pattern:
- *  - Respond immediately with { accepted: true, job_id }.
- *  - Then await runStagehand(...) in the same handler.
- *  - Always POST a final callback with job_id, success, extraction, liveSessionUrl, error.
- */
+const HARD_TIMEOUT_MS = 4 * 60 * 1000;
+
 app.post("/run", async (req, res) => {
   const { url, instructions, callback_url, job_id, shared_secret } = req.body || {};
-  console.log("Received /run request:", req.body);
-
   if (!instructions) {
-    return res.status(400).json({
-      accepted: false,
-      error: "Missing 'instructions' in request body",
-    });
+    return res.status(400).json({ accepted: false, error: "Missing 'instructions'" });
   }
-
-  // Acknowledge immediately so Lovable's Worker returns quickly
   res.json({ accepted: true, job_id });
 
-  // Now, still inside the same request handler, run Stagehand and send the callback
+  let result;
   try {
-    const result = await runStagehand({ url, instructions });
+    result = await Promise.race([
+      runStagehand({ url, instructions }),
+      new Promise((resolve) =>
+        setTimeout(
+          () => resolve({ success: false, result: null, error: "render_hard_timeout_4min" }),
+          HARD_TIMEOUT_MS,
+        ),
+      ),
+    ]);
+  } catch (err) {
+    result = { success: false, result: null, error: err.message || "unknown_error" };
+  }
 
-    if (!callback_url) {
-      console.warn("No callback_url provided; not sending callback.");
-      return;
-    }
+  if (!callback_url) return;
 
-    // Build a simple "extraction" string from agentResult for Lovable
-    let extraction = "";
-    if (result.result && result.result.agentResult) {
-      if (typeof result.result.agentResult === "string") {
-        extraction = result.result.agentResult;
-      } else {
-        try {
-          extraction = JSON.stringify(result.result.agentResult);
-        } catch {
-          extraction = "";
-        }
-      }
-    }
+  let extraction = "";
+  const ar = result.result?.agentResult;
+  if (ar) extraction = typeof ar === "string" ? ar : safeStringify(ar);
+  if (result.result?.pageText) extraction += `\n\n[final_page_text]\n${result.result.pageText}`;
+  if (result.result?.finalUrl) extraction += `\n\n[final_url] ${result.result.finalUrl}`;
 
+  try {
     await fetch(callback_url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Stagehand-Secret": shared_secret,
-      },
+      headers: { "Content-Type": "application/json", "X-Stagehand-Secret": shared_secret },
       body: JSON.stringify({
         job_id,
         success: result.success,
@@ -142,34 +111,12 @@ app.post("/run", async (req, res) => {
         error: result.error ?? null,
       }),
     });
-  } catch (err) {
-    console.error("Error during Stagehand run or callback:", err);
-
-    // Even if runStagehand or fetch throws, try to notify Lovable once
-    if (callback_url) {
-      try {
-        await fetch(callback_url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-Stagehand-Secret": shared_secret,
-          },
-          body: JSON.stringify({
-            job_id,
-            success: false,
-            extraction: "",
-            liveSessionUrl: null,
-            error: err.message || "Unknown error in Render Stagehand service",
-          }),
-        });
-      } catch (e) {
-        console.error("Failed to POST error callback to Lovable:", e);
-      }
-    }
+  } catch (e) {
+    console.error("Callback POST failed:", e);
   }
 });
 
+function safeStringify(v) { try { return JSON.stringify(v); } catch { return ""; } }
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Stagehand service listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Stagehand service listening on port ${PORT}`));
