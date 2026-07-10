@@ -110,7 +110,7 @@ ${instructions}
   }
 }
 
-const HARD_TIMEOUT_MS = 4 * 60 * 1000;
+const HARD_TIMEOUT_MS = 5 * 60 * 1000;
 
 app.post("/run", async (req, res) => {
   const { url, instructions, callback_url, job_id, shared_secret } = req.body || {};
