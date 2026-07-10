@@ -34,12 +34,14 @@ HARD RULES (DO NOT IGNORE):
 - After submitting, WAIT for and OBSERVE the confirmation: a thank-you message, success banner, redirect, or any visible change confirming the form was sent.
 - Only stop once submission is confirmed (or it is clearly impossible, e.g. a captcha you cannot solve).
 - In your final message, state clearly whether the form was submitted successfully and quote any confirmation text you saw.
+- When multiple buttons are visible, you MUST choose the one that belongs to the contact form you just filled. Prefer buttons near the form with labels like "Send", "Submit", "Contact", or "Send message". Do NOT click newsletter signup, cookie, or unrelated buttons.
+
 
 Original task:
 ${instructions}
 `.trim();
 
-    const agent = stagehand.agent({ model: "google/gemini-2.5-flash" });
+    const agent = stagehand.agent({ model: "anthropic/claude-sonnet-4-5" });
 
     const agentResult = await agent.execute({
       instruction: wrappedInstruction,
