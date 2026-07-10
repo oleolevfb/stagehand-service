@@ -48,7 +48,9 @@ Your job is to fill out and SUBMIT the contact form on this page.
 HARD RULES (DO NOT IGNORE):
 - Preserve all line breaks in any message/textarea field exactly as provided. Do not rephrase, rewrite, or collapse whitespace.
 - If the text you are given contains \\n or \\n\\n, type it exactly as-is into the textarea so the on-page text matches character-for-character.
-- Do NOT "tidy up" or normalize the message; treat it as literal text that must be copied exactly.
+- FIRST, paste or fill the entire message into the textarea in one operation (do NOT type it out character by character).
+- AFTER pasting, only make SMALL adjustments if absolutely necessary (e.g. inserting or deleting a line break), but do NOT clear the field and retype the whole message.
+- Never erase the entire message to start over; fix it in-place instead.
 - You MUST fill every required field before submitting.
 - You MUST click the submit/send button at the end.
 - After submitting, WAIT for and OBSERVE the confirmation: a thank-you message, success banner, redirect, or any visible change confirming the form was sent.
