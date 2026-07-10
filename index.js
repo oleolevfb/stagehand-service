@@ -2,13 +2,33 @@ require("dotenv").config();
 const express = require("express");
 const { Stagehand } = require("@browserbasehq/stagehand");
 
-// Node 18+ has global fetch; if you’re on older Node, uncomment next line:
+// Node 18+ has global fetch; if you're on older Node, uncomment next line:
 // const fetch = require("node-fetch");
 
 const app = express();
 app.use(express.json());
 
 app.get("/", (_req, res) => res.send("Stagehand service is running"));
+
+function parseOutcome(text) {
+  if (!text) return { outcome: undefined, excerpt: null };
+  const m = String(text).match(
+    /OUTCOME:\s*(CONFIRMED|CAPTCHA_BLOCKED|NO_CONFIRMATION|ERROR)\s*[—:-]?\s*(.{0,400})?/i,
+  );
+  if (!m) return { outcome: undefined, excerpt: null };
+  return {
+    outcome: m[1].toLowerCase(), // confirmed | captcha_blocked | no_confirmation | error
+    excerpt: (m[2] || "").trim().slice(0, 300) || null,
+  };
+}
+
+function safeStringify(v) {
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return "";
+  }
+}
 
 async function runStagehand({ url, instructions }) {
   let stagehand;
@@ -33,9 +53,15 @@ HARD RULES (DO NOT IGNORE):
 - You MUST click the submit/send button at the end.
 - After submitting, WAIT for and OBSERVE the confirmation: a thank-you message, success banner, redirect, or any visible change confirming the form was sent.
 - Only stop once submission is confirmed (or it is clearly impossible, e.g. a captcha you cannot solve).
-- In your final message, state clearly whether the form was submitted successfully and quote any confirmation text you saw.
 - When multiple buttons are visible, you MUST choose the one that belongs to the contact form you just filled. Prefer buttons near the form with labels like "Send", "Submit", "Contact", or "Send message". Do NOT click newsletter signup, cookie, or unrelated buttons.
 
+FINAL OUTPUT CONTRACT (MANDATORY):
+On the very last line of your final message, print EXACTLY ONE of:
+  OUTCOME: CONFIRMED — <first 200 chars of the confirmation text or URL you saw>
+  OUTCOME: CAPTCHA_BLOCKED — <describe the captcha>
+  OUTCOME: NO_CONFIRMATION — <what the page showed after clicking submit>
+  OUTCOME: ERROR — <what went wrong>
+Do not omit this line. Do not use any other keyword. This line is how the calling system decides whether the submission succeeded.
 
 Original task:
 ${instructions}
@@ -118,30 +144,35 @@ app.post("/run", async (req, res) => {
   if (result.result?.pageText) extraction += `\n\n[final_page_text]\n${result.result.pageText}`;
   if (result.result?.finalUrl) extraction += `\n\n[final_url] ${result.result.finalUrl}`;
 
+  const { outcome, excerpt } = parseOutcome(extraction);
+
+  console.log("[stagehand] run finished", {
+    job_id,
+    success: result.success,
+    outcome,
+    error: result.error,
+    extraction_preview: (extraction || "").slice(0, 200),
+  });
+
   try {
-    await fetch(callback_url, {
+    const cbRes = await fetch(callback_url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-Stagehand-Secret": shared_secret },
       body: JSON.stringify({
         job_id,
-        success: result.success,
+        success: outcome ? outcome === "confirmed" : result.success,
+        outcome,
+        confirmation_excerpt: excerpt,
         extraction,
         liveSessionUrl: result.result?.liveSessionUrl ?? null,
         error: result.error ?? null,
       }),
     });
+    console.log("[stagehand] callback POST", { job_id, status: cbRes.status, ok: cbRes.ok });
   } catch (e) {
     console.error("Callback POST failed:", e);
   }
 });
-
-function safeStringify(v) {
-  try {
-    return JSON.stringify(v);
-  } catch {
-    return "";
-  }
-}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Stagehand service listening on port ${PORT}`));
