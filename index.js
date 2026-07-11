@@ -8,18 +8,34 @@ app.use(express.json({ limit: "2mb" }));
 
 app.get("/", (_req, res) => res.send("Stagehand service is running"));
 
+const PORT = process.env.PORT || 3000;
+const HARD_TIMEOUT_MS = 4 * 60 * 1000;
+const INITIAL_RENDER_WAIT_MS = 12_000;
+const POST_AGENT_RENDER_WAIT_MS = 10_000;
+
 const MESSAGE_REGEX =
-  /message|comments?|inquir(?:y|ies)|questions?|details|notes|how can we help|tell us|your\s*message|additional\s*(?:info|information)|describe|reason\s*for|what\s*can\s*we\s*help/i;
+  /message|comments?|inquir(?:y|ies)|questions?|details|notes|tell us|how can we help|your\s*message|additional\s*(?:info|information)|describe|reason\s*(?:for|of)|what\s*can\s*we\s*help|anything\s*else|enquiry/i;
 
 const HONEYPOT_REGEX =
-  /honeypot|url2|trap|bot|website\b|company_website|your_website/i;
+  /honeypot|url2|trap|bot|website\b|company_website|confirm_email|email_confirm/i;
 
-const FORM_HINT_REGEX =
-  /contact|reach us|inquir|appointment|consultation|get in touch|request/i;
+const SHORT_FIELD_REGEX =
+  /first\s*name|last\s*name|full\s*name|name\b|email|e-mail|phone|mobile|tel\b|company|organization|business|address|city|state|zip|postal|country|subject|service|procedure|budget|date|time|birthday|birth\s*date/i;
 
-const HARD_TIMEOUT_MS = 4 * 60 * 1000;
-const INITIAL_FORM_WAIT_MS = 15_000;
-const SECONDARY_FORM_WAIT_MS = 8_000;
+const CONTACT_LINK_REGEX =
+  /contact|reach us|inquir|appointment|consultation|get in touch|request|book/i;
+
+const EDITABLE_SELECTOR = [
+  "textarea",
+  "input[type='text']",
+  "input:not([type])",
+  "[contenteditable='true']",
+  "[role='textbox']",
+  ".ProseMirror",
+  ".ql-editor",
+  ".public-DraftEditor-content",
+  "[data-lexical-editor='true']",
+].join(", ");
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -33,33 +49,32 @@ function safeStringify(value) {
   }
 }
 
-function getFrameDescription(frame, index) {
-  let url = "";
-  try {
-    url = frame.url();
-  } catch {}
-
-  return {
-    frameIndex: index,
-    frameUrl: url || "unknown",
-    isMainFrame: index === 0,
-  };
+function sanitizeForCallback(value, maxLength = 2000) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxLength);
 }
 
-async function waitForFormRender(page, timeoutMs = INITIAL_FORM_WAIT_MS) {
+function candidateSummary(candidate) {
+  const { frame, ...summary } = candidate;
+  return summary;
+}
+
+function summarizeCandidates(candidates) {
+  return candidates.map(candidateSummary);
+}
+
+async function waitForEditableControl(page, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const frames = page.frames();
-
-    for (const frame of frames) {
+    for (const frame of page.frames()) {
       try {
-        const count = await frame.locator("textarea, [contenteditable='true']").count();
-        if (count > 0) return true;
+        if (await frame.locator(EDITABLE_SELECTOR).count()) {
+          return true;
+        }
       } catch {}
     }
 
-    await sleep(500);
+    await sleep(400);
   }
 
   return false;
@@ -67,436 +82,560 @@ async function waitForFormRender(page, timeoutMs = INITIAL_FORM_WAIT_MS) {
 
 async function clickLikelyContactLink(page) {
   try {
-    const contactLink = page
-      .getByRole("link", { name: FORM_HINT_REGEX })
+    const link = page
+      .getByRole("link", { name: CONTACT_LINK_REGEX })
       .first();
 
-    if (await contactLink.count()) {
-      await contactLink.click({ timeout: 5000 }).catch(() => {});
-      await page.waitForLoadState("domcontentloaded").catch(() => {});
-      await sleep(1200);
-      return true;
-    }
-  } catch {}
+    if (!(await link.count())) return false;
 
-  return false;
+    await link.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+    await sleep(1000);
+
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-async function collectTextareaCandidates(page) {
+async function inspectEditableControl(frame, frameIndex, locator, index) {
+  return locator
+    .evaluate(
+      (el, { frameIndex, index, messageRegexSource, honeypotRegexSource, shortFieldRegexSource }) => {
+        const messageRe = new RegExp(messageRegexSource, "i");
+        const honeypotRe = new RegExp(honeypotRegexSource, "i");
+        const shortFieldRe = new RegExp(shortFieldRegexSource, "i");
+
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+
+        const visible =
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          style.opacity !== "0" &&
+          rect.width > 0 &&
+          rect.height > 0;
+
+        const tag = el.tagName.toLowerCase();
+        const type = (el.getAttribute("type") || "").toLowerCase();
+
+        const isInput = tag === "input";
+        const isTextarea = tag === "textarea";
+        const isContentEditable =
+          el.getAttribute("contenteditable") === "true" ||
+          el.isContentEditable ||
+          el.getAttribute("role") === "textbox";
+
+        const name = el.getAttribute("name") || "";
+        const id = el.getAttribute("id") || "";
+        const placeholder = el.getAttribute("placeholder") || "";
+        const ariaLabel = el.getAttribute("aria-label") || "";
+        const ariaDescribedBy = el.getAttribute("aria-describedby") || "";
+        const role = el.getAttribute("role") || "";
+
+        let describedByText = "";
+        for (const idPart of ariaDescribedBy.split(/\s+/).filter(Boolean)) {
+          const described = document.getElementById(idPart);
+          if (described) describedByText += ` ${described.textContent || ""}`;
+        }
+
+        let labelText = "";
+
+        if (id) {
+          const explicitLabel = document.querySelector(
+            `label[for="${CSS.escape(id)}"]`,
+          );
+          if (explicitLabel) labelText = explicitLabel.textContent || "";
+        }
+
+        if (!labelText) {
+          const wrappingLabel = el.closest("label");
+          if (wrappingLabel) labelText = wrappingLabel.textContent || "";
+        }
+
+        const group = el.closest(
+          ".gfield, .form-group, .field, .field-wrap, .form-field, .hs-form-field, .wpcf7-form-control-wrap, li, p, fieldset, [data-field]",
+        );
+
+        const groupText = group?.innerText || "";
+        const legendText = el.closest("fieldset")?.querySelector("legend")?.innerText || "";
+        const formText = el.closest("form")?.innerText?.slice(0, 2500) || "";
+
+        const rows = Number.parseInt(el.getAttribute("rows") || "0", 10) || 0;
+        const cols = Number.parseInt(el.getAttribute("cols") || "0", 10) || 0;
+
+        const textContext = [
+          name,
+          id,
+          placeholder,
+          ariaLabel,
+          describedByText,
+          labelText,
+          legendText,
+          groupText,
+          role,
+        ]
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        const lowerContext = textContext.toLowerCase();
+
+        const disabled =
+          Boolean(el.disabled) ||
+          el.getAttribute("aria-disabled") === "true";
+
+        const readOnly =
+          Boolean(el.readOnly) ||
+          el.getAttribute("aria-readonly") === "true";
+
+        const hiddenByAttribute =
+          el.hasAttribute("hidden") ||
+          el.getAttribute("aria-hidden") === "true" ||
+          type === "hidden";
+
+        const existingValue =
+          typeof el.value === "string"
+            ? el.value
+            : el.innerText || el.textContent || "";
+
+        let score = 0;
+
+        if (isTextarea) score += 10;
+        if (isContentEditable) score += 8;
+        if (role === "textbox") score += 6;
+        if (messageRe.test(textContext)) score += 18;
+        if (messageRe.test(labelText)) score += 7;
+        if (messageRe.test(placeholder)) score += 5;
+        if (messageRe.test(name) || messageRe.test(id)) score += 5;
+
+        if (rect.height >= 80) score += 8;
+        else if (rect.height >= 45) score += 3;
+
+        if (rows >= 3) score += 5;
+        if (cols >= 30) score += 2;
+
+        // A plain input should need strong semantic evidence before it is treated
+        // as a long-message target.
+        if (isInput) score -= 10;
+
+        if (shortFieldRe.test(textContext)) score -= 25;
+        if (honeypotRe.test(textContext)) score -= 40;
+        if (!visible || hiddenByAttribute) score -= 50;
+        if (disabled || readOnly) score -= 50;
+
+        const likelyLongText =
+          isTextarea ||
+          isContentEditable ||
+          rect.height >= 70 ||
+          rows >= 3 ||
+          role === "textbox";
+
+        const safeAsMessageTarget =
+          score >= 12 ||
+          (likelyLongText && score >= 0 && !shortFieldRe.test(textContext));
+
+        return {
+          frameIndex,
+          frameUrl: window.location.href,
+          index,
+          tag,
+          type,
+          name,
+          id,
+          placeholder,
+          ariaLabel,
+          role,
+          labelText: labelText.trim().slice(0, 500),
+          context: textContext.slice(0, 1200),
+          formText: formText.slice(0, 1200),
+          visible,
+          disabled,
+          readOnly,
+          hiddenByAttribute,
+          isTextarea,
+          isInput,
+          isContentEditable,
+          likelyLongText,
+          safeAsMessageTarget,
+          score,
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          rows,
+          cols,
+          existingValueLength: String(existingValue || "").length,
+        };
+      },
+      {
+        frameIndex,
+        index,
+        messageRegexSource: MESSAGE_REGEX.source,
+        honeypotRegexSource: HONEYPOT_REGEX.source,
+        shortFieldRegexSource: SHORT_FIELD_REGEX.source,
+      },
+    )
+    .catch((err) => ({
+      frameIndex,
+      index,
+      error: `inspect_error: ${err.message || err}`,
+      score: -999,
+    }));
+}
+
+async function inventoryEditableControls(page) {
+  const candidates = [];
   const frames = page.frames();
-  const results = [];
 
   for (let frameIndex = 0; frameIndex < frames.length; frameIndex++) {
     const frame = frames[frameIndex];
-    const frameInfo = getFrameDescription(frame, frameIndex);
 
+    let count = 0;
     try {
-      const candidates = await frame.$$eval(
-        "textarea",
-        (nodes, regexes) => {
-          const messageRe = new RegExp(regexes.message, "i");
-          const honeypotRe = new RegExp(regexes.honeypot, "i");
+      count = await frame.locator(EDITABLE_SELECTOR).count();
+    } catch {
+      continue;
+    }
 
-          return nodes.map((el, idx) => {
-            const style = window.getComputedStyle(el);
-            const rect = el.getBoundingClientRect();
+    for (let index = 0; index < count; index++) {
+      const locator = frame.locator(EDITABLE_SELECTOR).nth(index);
+      const info = await inspectEditableControl(frame, frameIndex, locator, index);
 
-            const visible =
-              style.display !== "none" &&
-              style.visibility !== "hidden" &&
-              style.opacity !== "0" &&
-              rect.width > 0 &&
-              rect.height > 0;
-
-            const disabled =
-              el.hasAttribute("disabled") ||
-              el.getAttribute("aria-disabled") === "true";
-
-            const readOnly =
-              el.hasAttribute("readonly") ||
-              el.getAttribute("aria-readonly") === "true";
-
-            const name = el.getAttribute("name") || "";
-            const id = el.getAttribute("id") || "";
-            const placeholder = el.getAttribute("placeholder") || "";
-            const aria = el.getAttribute("aria-label") || "";
-            const autocomplete = el.getAttribute("autocomplete") || "";
-
-            let labelText = "";
-
-            if (id) {
-              const label = document.querySelector(
-                `label[for="${CSS.escape(id)}"]`,
-              );
-              if (label) labelText = label.textContent || "";
-            }
-
-            if (!labelText) {
-              const closestLabel = el.closest("label");
-              if (closestLabel) labelText = closestLabel.textContent || "";
-            }
-
-            if (!labelText && el.parentElement) {
-              const parentLabel = el.parentElement.querySelector("label");
-              if (parentLabel) labelText = parentLabel.textContent || "";
-            }
-
-            const surroundingText = [
-              el.parentElement?.innerText || "",
-              el.closest("fieldset")?.innerText || "",
-              el.closest("form")?.innerText?.slice(0, 2000) || "",
-            ].join(" ");
-
-            const haystack = [
-              name,
-              id,
-              placeholder,
-              aria,
-              autocomplete,
-              labelText,
-              surroundingText,
-            ].join(" ");
-
-            const rows =
-              parseInt(el.getAttribute("rows") || "0", 10) || 0;
-            const cols =
-              parseInt(el.getAttribute("cols") || "0", 10) || 0;
-
-            let score = 0;
-
-            if (messageRe.test(haystack)) score += 8;
-            if (messageRe.test(labelText)) score += 4;
-            if (messageRe.test(placeholder)) score += 3;
-            if (messageRe.test(name) || messageRe.test(id)) score += 3;
-
-            score += Math.min(5, Math.floor((rows * cols) / 100));
-
-            if (visible) score += 2;
-            if (!visible) score -= 25;
-            if (disabled || readOnly) score -= 25;
-            if (honeypotRe.test(haystack)) score -= 30;
-
-            let selector = "";
-            if (id) selector = `textarea#${CSS.escape(id)}`;
-            else if (name) {
-              selector = `textarea[name="${CSS.escape(name)}"]`;
-            } else {
-              selector = `textarea >> nth=${idx}`;
-            }
-
-            return {
-              idx,
-              selector,
-              score,
-              visible,
-              disabled,
-              readOnly,
-              name,
-              id,
-              placeholder,
-              aria,
-              labelText: labelText.trim().slice(0, 300),
-              rows,
-              cols,
-            };
-          });
-        },
-        {
-          message: MESSAGE_REGEX.source,
-          honeypot: HONEYPOT_REGEX.source,
-        },
-      );
-
-      for (const candidate of candidates) {
-        results.push({
-          ...candidate,
-          ...frameInfo,
-          frame,
-        });
-      }
-    } catch (err) {
-      results.push({
-        ...frameInfo,
-        selector: null,
-        score: -999,
-        visible: false,
-        error: `candidate_scan_error: ${err.message || err}`,
+      candidates.push({
+        ...info,
         frame,
+        selector: EDITABLE_SELECTOR,
       });
     }
+
+    // Rich-text editors sometimes use an iframe whose body is contenteditable.
+    // This handles accessible iframe editor documents as a special candidate.
+    try {
+      const body = frame.locator("body[contenteditable='true']").first();
+      if (await body.count()) {
+        const bodyInfo = await inspectEditableControl(
+          frame,
+          frameIndex,
+          body,
+          -1,
+        );
+
+        candidates.push({
+          ...bodyInfo,
+          frame,
+          selector: "body[contenteditable='true']",
+          isIframeBodyEditor: true,
+        });
+      }
+    } catch {}
   }
 
-  return results;
+  return candidates;
 }
 
-function selectBestTextarea(candidates) {
-  const usable = candidates.filter(
+function chooseMessageCandidate(candidates) {
+  const eligible = candidates.filter(
     (candidate) =>
-      candidate.selector &&
+      !candidate.error &&
       candidate.visible &&
       !candidate.disabled &&
       !candidate.readOnly &&
-      candidate.score > -20,
+      !candidate.hiddenByAttribute &&
+      candidate.safeAsMessageTarget,
   );
 
-  const scoredMatches = usable
-    .filter((candidate) => candidate.score > 0)
-    .sort((a, b) => b.score - a.score);
+  const sorted = [...eligible].sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.height !== a.height) return b.height - a.height;
+    return a.index - b.index;
+  });
 
-  if (scoredMatches.length) {
+  if (sorted.length) {
     return {
-      best: scoredMatches[0],
-      selectionReason: "best_scored_message_candidate",
-      usable,
+      candidate: sorted[0],
+      reason: "highest_scoring_eligible_candidate",
+      eligible,
     };
   }
 
-  if (usable.length === 1) {
-    return {
-      best: usable[0],
-      selectionReason: "only_visible_usable_textarea",
-      usable,
-    };
-  }
+  // Conservative fallback: only use a sole visible textarea/contenteditable,
+  // never a generic short text input.
+  const longControls = candidates.filter(
+    (candidate) =>
+      !candidate.error &&
+      candidate.visible &&
+      !candidate.disabled &&
+      !candidate.readOnly &&
+      !candidate.hiddenByAttribute &&
+      (candidate.isTextarea || candidate.isContentEditable) &&
+      !HONEYPOT_REGEX.test(candidate.context || ""),
+  );
 
-  const largeTextarea = usable
-    .filter((candidate) => candidate.rows >= 3 || candidate.cols >= 20)
-    .sort((a, b) => b.score - a.score)[0];
-
-  if (largeTextarea) {
+  if (longControls.length === 1) {
     return {
-      best: largeTextarea,
-      selectionReason: "largest_visible_usable_textarea_fallback",
-      usable,
+      candidate: longControls[0],
+      reason: "only_visible_long_text_control",
+      eligible: longControls,
     };
   }
 
   return {
-    best: null,
-    selectionReason: "no_suitable_textarea",
-    usable,
+    candidate: null,
+    reason: "no_safe_message_candidate",
+    eligible,
   };
 }
 
-async function fillTextareaCandidate(
-  candidate,
-  message,
-  messageParagraphs,
-  { lockAfterFill = true } = {},
-) {
-  const loc = candidate.frame.locator(candidate.selector).first();
+function buildLocatorFromCandidate(candidate) {
+  return candidate.frame.locator(candidate.selector).nth(candidate.index);
+}
 
-  let verifiedLength = 0;
-  let usedSequentialFallback = false;
-  let locked = false;
-
+async function readControlValue(locator, candidate) {
   try {
-    await loc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
-    await loc.click({ timeout: 5000 }).catch(() => {});
-    await loc.fill("", { timeout: 5000 }).catch(() => {});
-
-    // Fast, one-operation value replacement. This is the preferred path.
-    await loc.fill(message, { timeout: 12_000 });
-
-    const value = await loc.inputValue().catch(() => "");
-    verifiedLength = value.length;
-
-    if (value.length >= Math.min(20, message.length)) {
-      if (lockAfterFill) {
-        locked = await loc
-          .evaluate((el) => {
-            try {
-              el.setAttribute("data-lovable-prefilled", "1");
-              el.readOnly = true;
-
-              // Ensure frameworks listening for input/change see the final value.
-              el.dispatchEvent(new Event("input", { bubbles: true }));
-              el.dispatchEvent(new Event("change", { bubbles: true }));
-
-              if (typeof el.blur === "function") el.blur();
-              return true;
-            } catch {
-              return false;
-            }
-          })
-          .catch(() => false);
-      }
-
-      return {
-        filled: true,
-        selector: candidate.selector,
-        frameUrl: candidate.frameUrl,
-        frameIndex: candidate.frameIndex,
-        reason: "fill_ok",
-        verifiedLength,
-        usedSequentialFallback,
-        locked,
-      };
+    if (candidate.isTextarea || candidate.isInput) {
+      return await locator.inputValue();
     }
 
-    // Only use character-by-character entry if the site's control rejects fill().
-    usedSequentialFallback = true;
-    await loc.fill("", { timeout: 5000 }).catch(() => {});
-    await loc.click({ timeout: 5000 }).catch(() => {});
-
-    const paragraphs =
-      Array.isArray(messageParagraphs) && messageParagraphs.length
-        ? messageParagraphs
-        : String(message).split(/\n{2,}/g);
-
-    for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
-      const lines = String(paragraphs[paragraphIndex]).split("\n");
-
-      for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-        await loc.pressSequentially(lines[lineIndex], { delay: 1 });
-
-        if (lineIndex < lines.length - 1) {
-          await candidate.frame.keyboard.press("Shift+Enter").catch(() => {});
-        }
-      }
-
-      if (paragraphIndex < paragraphs.length - 1) {
-        await candidate.frame.keyboard.press("Enter").catch(() => {});
-        await candidate.frame.keyboard.press("Enter").catch(() => {});
-      }
-    }
-
-    const fallbackValue = await loc.inputValue().catch(() => "");
-    verifiedLength = fallbackValue.length;
-
-    if (!fallbackValue.length) {
-      return {
-        filled: false,
-        selector: candidate.selector,
-        frameUrl: candidate.frameUrl,
-        frameIndex: candidate.frameIndex,
-        reason: "fill_and_sequential_fallback_failed",
-        verifiedLength,
-        usedSequentialFallback,
-        locked: false,
-      };
-    }
-
-    if (lockAfterFill) {
-      locked = await loc
-        .evaluate((el) => {
-          try {
-            el.setAttribute("data-lovable-prefilled", "1");
-            el.readOnly = true;
-            el.dispatchEvent(new Event("input", { bubbles: true }));
-            el.dispatchEvent(new Event("change", { bubbles: true }));
-            if (typeof el.blur === "function") el.blur();
-            return true;
-          } catch {
-            return false;
-          }
-        })
-        .catch(() => false);
-    }
-
-    return {
-      filled: true,
-      selector: candidate.selector,
-      frameUrl: candidate.frameUrl,
-      frameIndex: candidate.frameIndex,
-      reason: "sequential_fallback_ok",
-      verifiedLength,
-      usedSequentialFallback,
-      locked,
-    };
-  } catch (err) {
-    return {
-      filled: false,
-      selector: candidate.selector,
-      frameUrl: candidate.frameUrl,
-      frameIndex: candidate.frameIndex,
-      reason: `fill_error: ${err.message || err}`,
-      verifiedLength,
-      usedSequentialFallback,
-      locked,
-    };
+    return await locator.evaluate((el) => el.innerText || el.textContent || "");
+  } catch {
+    return "";
   }
 }
 
-function sanitizeCandidates(candidates) {
-  return candidates.map(({ frame, ...candidate }) => candidate);
+async function dispatchFrameworkEvents(locator) {
+  return locator
+    .evaluate((el) => {
+      try {
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
+        return true;
+      } catch {
+        return false;
+      }
+    })
+    .catch(() => false);
 }
 
-async function prefillMessageTextarea(
-  page,
-  message,
-  messageParagraphs,
-  { waitMs = INITIAL_FORM_WAIT_MS, lockAfterFill = true } = {},
-) {
+async function nativeValueSetterFallback(locator, candidate, message) {
+  if (!candidate.isTextarea && !candidate.isInput) return false;
+
+  return locator
+    .evaluate((el, value) => {
+      const proto =
+        el.tagName.toLowerCase() === "textarea"
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+
+      const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+
+      if (!descriptor?.set) return false;
+
+      descriptor.set.call(el, value);
+
+      el.dispatchEvent(
+        new InputEvent("input", {
+          bubbles: true,
+          inputType: "insertText",
+          data: value,
+        }),
+      );
+
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("blur", { bubbles: true }));
+
+      return true;
+    }, message)
+    .catch(() => false);
+}
+
+async function contentEditableFallback(locator, candidate, message) {
+  if (!candidate.isContentEditable) return false;
+
+  return locator
+    .evaluate((el, value) => {
+      try {
+        el.focus();
+
+        // Replace existing content in an editor-compatible way where possible.
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        range.collapse(true);
+
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+
+        // execCommand remains useful for a broad set of browser editors.
+        const inserted = document.execCommand("insertText", false, value);
+
+        if (!inserted) {
+          el.textContent = value;
+        }
+
+        el.dispatchEvent(
+          new InputEvent("input", {
+            bubbles: true,
+            inputType: "insertText",
+            data: value,
+          }),
+        );
+
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new Event("blur", { bubbles: true }));
+
+        return true;
+      } catch {
+        return false;
+      }
+    }, message)
+    .catch(() => false);
+}
+
+async function lockMessageControl(locator) {
+  return locator
+    .evaluate((el) => {
+      try {
+        el.setAttribute("data-lovable-prefilled", "1");
+
+        if ("readOnly" in el) {
+          el.readOnly = true;
+        } else {
+          el.setAttribute("contenteditable", "false");
+          el.setAttribute("aria-readonly", "true");
+        }
+
+        if (typeof el.blur === "function") el.blur();
+        return true;
+      } catch {
+        return false;
+      }
+    })
+    .catch(() => false);
+}
+
+async function fillMessageCandidate(candidate, message, { lock = true } = {}) {
+  const locator = buildLocatorFromCandidate(candidate);
+  const minVerifiedLength = Math.min(20, String(message).length);
+
+  try {
+    await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    await locator.click({ timeout: 5000 }).catch(() => {});
+
+    // Preferred fast path. Playwright fill handles input, textarea and
+    // contenteditable fields without character-by-character typing.
+    await locator.fill(message, { timeout: 12_000 });
+
+    await dispatchFrameworkEvents(locator);
+
+    let value = await readControlValue(locator, candidate);
+
+    if (value.length >= minVerifiedLength) {
+      const locked = lock ? await lockMessageControl(locator) : false;
+
+      return {
+        filled: true,
+        locked,
+        method: "locator.fill",
+        verifiedLength: value.length,
+        candidate: candidateSummary(candidate),
+      };
+    }
+  } catch {}
+
+  // Framework fallback for React/Vue/Angular-style controlled inputs.
+  const nativeSet = await nativeValueSetterFallback(locator, candidate, message);
+
+  if (nativeSet) {
+    await sleep(150);
+
+    const value = await readControlValue(locator, candidate);
+
+    if (value.length >= minVerifiedLength) {
+      const locked = lock ? await lockMessageControl(locator) : false;
+
+      return {
+        filled: true,
+        locked,
+        method: "native_value_setter",
+        verifiedLength: value.length,
+        candidate: candidateSummary(candidate),
+      };
+    }
+  }
+
+  // Rich text / contenteditable fallback.
+  const editorSet = await contentEditableFallback(locator, candidate, message);
+
+  if (editorSet) {
+    await sleep(150);
+
+    const value = await readControlValue(locator, candidate);
+
+    if (value.length >= minVerifiedLength) {
+      const locked = lock ? await lockMessageControl(locator) : false;
+
+      return {
+        filled: true,
+        locked,
+        method: "contenteditable_injection",
+        verifiedLength: value.length,
+        candidate: candidateSummary(candidate),
+      };
+    }
+  }
+
+  return {
+    filled: false,
+    locked: false,
+    method: null,
+    verifiedLength: 0,
+    candidate: candidateSummary(candidate),
+    reason: "all_direct_fill_strategies_failed",
+  };
+}
+
+async function directFillMessage(page, message, { waitMs = 0, lock = true } = {}) {
   if (!message) {
     return {
       filled: false,
       locked: false,
-      selector: null,
       reason: "no_message",
-      candidates: [],
+      inventory: [],
     };
   }
 
-  let formFound = await waitForFormRender(page, waitMs);
-
-  if (!formFound) {
-    await clickLikelyContactLink(page);
-    formFound = await waitForFormRender(page, SECONDARY_FORM_WAIT_MS);
+  if (waitMs > 0) {
+    await waitForEditableControl(page, waitMs);
   }
 
-  const candidates = await collectTextareaCandidates(page);
-  const { best, selectionReason, usable } = selectBestTextarea(candidates);
+  const inventory = await inventoryEditableControls(page);
+  const { candidate, reason, eligible } = chooseMessageCandidate(inventory);
 
-  if (!best) {
+  if (!candidate) {
     return {
       filled: false,
       locked: false,
-      selector: null,
-      reason: formFound
-        ? `no_matching_textarea:${selectionReason}`
-        : "no_textarea_after_wait_and_contact_link_attempt",
-      selectionReason,
-      usableTextareaCount: usable.length,
-      candidates: sanitizeCandidates(candidates),
+      reason,
+      eligibleCount: eligible.length,
+      inventory: summarizeCandidates(inventory),
     };
   }
 
-  const result = await fillTextareaCandidate(best, message, messageParagraphs, {
-    lockAfterFill,
-  });
+  const result = await fillMessageCandidate(candidate, message, { lock });
 
   return {
     ...result,
-    selectionReason,
-    usableTextareaCount: usable.length,
-    candidates: sanitizeCandidates(candidates),
+    selectionReason: reason,
+    eligibleCount: eligible.length,
+    inventory: summarizeCandidates(inventory),
   };
-}
-
-function getAgentText(agentResult) {
-  if (!agentResult) return "";
-
-  if (typeof agentResult === "string") return agentResult;
-
-  const possibleText = [
-    agentResult.message,
-    agentResult.result,
-    agentResult.output,
-    agentResult.text,
-    agentResult.summary,
-  ]
-    .filter(Boolean)
-    .join("\n");
-
-  return `${possibleText}\n${safeStringify(agentResult)}`;
 }
 
 function parseOutcome(text) {
   if (!text) return { outcome: undefined, excerpt: null };
 
   const match = String(text).match(
-    /OUTCOME:\s*(CONFIRMED|CAPTCHA_BLOCKED|NO_CONFIRMATION|ERROR)\s*[—:-]?\s*(.{0,400})?/i,
+    /OUTCOME:\s*(CONFIRMED|CAPTCHA_BLOCKED|READY_FOR_MESSAGE|MESSAGE_FIELD_NOT_AUTOMATABLE|NO_CONFIRMATION|ERROR)\s*[—:-]?\s*(.{0,500})?/i,
   );
 
   if (!match) return { outcome: undefined, excerpt: null };
@@ -505,6 +644,22 @@ function parseOutcome(text) {
     outcome: match[1].toLowerCase(),
     excerpt: (match[2] || "").trim().slice(0, 300) || null,
   };
+}
+
+function agentResultToText(agentResult) {
+  if (!agentResult) return "";
+  if (typeof agentResult === "string") return agentResult;
+
+  return [
+    agentResult.message,
+    agentResult.result,
+    agentResult.output,
+    agentResult.text,
+    agentResult.summary,
+    safeStringify(agentResult),
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function getFinalPageDetails(page) {
@@ -516,13 +671,19 @@ async function getFinalPageDetails(page) {
   } catch {}
 
   try {
-    pageText = (await page.locator("body").innerText()).slice(0, 2000);
+    pageText = (await page.locator("body").innerText()).slice(0, 2500);
   } catch {}
 
   return { finalUrl, pageText };
 }
 
-async function runStagehand({ url, instructions, message, message_paragraphs }) {
+async function runStagehand({
+  url,
+  instructions,
+  message,
+  message_paragraphs,
+  allow_agent_message_typing = false,
+}) {
   let stagehand;
 
   try {
@@ -534,102 +695,99 @@ async function runStagehand({ url, instructions, message, message_paragraphs }) 
 
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
     await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
-    await sleep(1000);
+    await sleep(750);
 
-    // Phase 1: Attempt deterministic message fill before agent work.
-    let prefill = await prefillMessageTextarea(page, message, message_paragraphs, {
-      waitMs: INITIAL_FORM_WAIT_MS,
-      lockAfterFill: true,
+    // PHASE 1: Deterministic attempt before the AI touches the form.
+    let initialPrefill = await directFillMessage(page, message, {
+      waitMs: INITIAL_RENDER_WAIT_MS,
+      lock: true,
     });
 
-    console.log("[stagehand] initial prefill result", {
-      filled: prefill.filled,
-      locked: prefill.locked,
-      selector: prefill.selector,
-      frameUrl: prefill.frameUrl,
-      reason: prefill.reason,
-      selectionReason: prefill.selectionReason,
-      verifiedLength: prefill.verifiedLength,
-      usedSequentialFallback: prefill.usedSequentialFallback,
+    console.log("[stagehand] initial message fill", {
+      filled: initialPrefill.filled,
+      method: initialPrefill.method,
+      reason: initialPrefill.reason,
+      selectionReason: initialPrefill.selectionReason,
+      candidate: initialPrefill.candidate?.context,
     });
+
+    // If the contact form is not on the initially loaded screen, make a modest
+    // deterministic navigation attempt before handing navigation to the agent.
+    if (!initialPrefill.filled) {
+      await clickLikelyContactLink(page);
+    }
 
     const agent = stagehand.agent({
       model: "anthropic/claude-sonnet-4-6",
     });
 
-    const initialMessageNote =
-      prefill.filled && prefill.locked
-        ? `The message/comments textarea is ALREADY FILLED and LOCKED by the automation harness. It is tagged data-lovable-prefilled="1" and is intentionally readOnly. Do NOT click, focus, clear, type in, or edit it. Fill all OTHER required fields and submit the form.`
-        : prefill.filled
-          ? `The message/comments textarea has already been filled by the automation harness. Do NOT retype, clear, or edit it. Fill all OTHER required fields and submit the form.`
-          : `The long message has NOT yet been filled. Locate and prepare the contact form, and fill every required field EXCEPT the message/comments/inquiry field. Do NOT type the long message character by character. Do NOT submit yet. Stop only after the form and message field are visible and ready for a deterministic fill by the automation harness.`;
+    let preparationResult = null;
+    let finalAgentResult = null;
+    let secondPrefill = null;
 
-    const initialInstruction = `
-You are a browser automation agent controlling a real browser.
+    if (!initialPrefill.filled && message) {
+      // PHASE 2: The agent prepares the form but never receives the long message.
+      const preparationInstruction = `
+You are preparing a contact-form submission in a real browser.
 
-Your task is to complete a contact-form submission workflow.
+Your task:
+- Navigate to the correct contact, inquiry, appointment, or consultation form.
+- Open required modals, expand accordions, complete required preliminary steps, and make the complete form visible.
+- Fill all required SHORT fields using the information in the original task: name, email, phone, subject, dropdowns, consent boxes, etc.
+- Do NOT fill, edit, click, or focus the long message/comments/details/inquiry field.
+- Do NOT submit the form.
 
-${initialMessageNote}
+Stop only when the message/comments/details field is visible, enabled, and ready for external automation to fill.
 
-HARD RULES:
-- Fill every required field other than the message field described above.
-- If a CAPTCHA is detected, wait for Browserbase CAPTCHA handling to complete. If it does not resolve, return: OUTCOME: CAPTCHA_BLOCKED — <captcha type>
-- If the message is already filled, submit the form and wait for a confirmation.
-- If the message is not filled, do NOT submit. Prepare the form and stop.
-- On your FINAL line, print exactly one of:
-  OUTCOME: CONFIRMED — <first 200 chars of confirmation>
-  OUTCOME: CAPTCHA_BLOCKED — <captcha type>
-  OUTCOME: READY_FOR_MESSAGE — <brief description of visible message field>
-  OUTCOME: NO_CONFIRMATION — <what the page showed>
-  OUTCOME: ERROR — <what went wrong>
+On your FINAL line, print exactly:
+OUTCOME: READY_FOR_MESSAGE — <label, placeholder, or brief description of the message field>
+or:
+OUTCOME: CAPTCHA_BLOCKED — <captcha type>
+or:
+OUTCOME: ERROR — <what prevented form preparation>
 
 Original task:
 ${instructions}
 `.trim();
 
-    const initialAgentResult = await agent.execute({
-      instruction: initialInstruction,
-      maxSteps: 30,
-    });
-
-    let finalAgentResult = initialAgentResult;
-    let secondPrefill = null;
-
-    // Phase 2: If message could not be filled earlier, retry after the agent has
-    // opened/expanded/rendered the form. This keeps long-text entry deterministic.
-    if (message && !prefill.filled) {
-      secondPrefill = await prefillMessageTextarea(page, message, message_paragraphs, {
-        waitMs: SECONDARY_FORM_WAIT_MS,
-        lockAfterFill: true,
+      preparationResult = await agent.execute({
+        instruction: preparationInstruction,
+        maxSteps: 28,
       });
 
-      console.log("[stagehand] second prefill result", {
+      // PHASE 3: Re-inventory the rendered state and use direct fill again.
+      secondPrefill = await directFillMessage(page, message, {
+        waitMs: POST_AGENT_RENDER_WAIT_MS,
+        lock: true,
+      });
+
+      console.log("[stagehand] post-preparation message fill", {
         filled: secondPrefill.filled,
-        locked: secondPrefill.locked,
-        selector: secondPrefill.selector,
-        frameUrl: secondPrefill.frameUrl,
+        method: secondPrefill.method,
         reason: secondPrefill.reason,
         selectionReason: secondPrefill.selectionReason,
-        verifiedLength: secondPrefill.verifiedLength,
-        usedSequentialFallback: secondPrefill.usedSequentialFallback,
+        candidate: secondPrefill.candidate?.context,
       });
+    }
 
-      if (secondPrefill.filled) {
-        prefill = secondPrefill;
+    const successfulPrefill =
+      initialPrefill.filled ? initialPrefill : secondPrefill?.filled ? secondPrefill : null;
 
-        const submitInstruction = `
-You are continuing a contact-form workflow.
+    if (successfulPrefill) {
+      // PHASE 4: Submit only. The message is never supplied to the agent.
+      const submitInstruction = `
+You are completing a contact-form submission in a real browser.
 
-The long message field has now been filled by the automation harness.
-${secondPrefill.locked
-  ? "It is locked intentionally. Do NOT click, focus, clear, edit, or retype it."
-  : "Do NOT edit or retype the message field."}
+The long message field has already been filled by the automation harness.
+${successfulPrefill.locked
+  ? "It has been intentionally locked. Do NOT click, focus, clear, edit, or retype it."
+  : "Do NOT edit, clear, or retype the message field."}
 
-Now:
-1. Review that all other required fields are completed.
-2. Submit/send the form.
-3. Wait for and observe the result.
-4. If a CAPTCHA is detected, wait for Browserbase CAPTCHA handling to complete. If it does not resolve, return: OUTCOME: CAPTCHA_BLOCKED — <captcha type>
+Your task:
+- Verify the other required fields are complete.
+- Submit/send the form.
+- Wait for the result and inspect the page.
+- If a CAPTCHA is displayed, wait briefly for configured browser handling. If it remains blocked, report it.
 
 On your FINAL line, print exactly one of:
 OUTCOME: CONFIRMED — <first 200 chars of confirmation>
@@ -638,30 +796,29 @@ OUTCOME: NO_CONFIRMATION — <what the page showed>
 OUTCOME: ERROR — <what went wrong>
 `.trim();
 
-        finalAgentResult = await agent.execute({
-          instruction: submitInstruction,
-          maxSteps: 20,
-        });
-      } else {
-        // Absolute final fallback: agent may enter the long message, but is instructed
-        // to use direct fill/set-value first rather than simulated slow keystrokes.
-        const emergencyInstruction = `
-The automation harness could not directly fill the message field.
+      finalAgentResult = await agent.execute({
+        instruction: submitInstruction,
+        maxSteps: 16,
+      });
+    } else if (allow_agent_message_typing && message) {
+      // Explicitly opt-in only. This is disabled by default to avoid the slow
+      // agent typing behaviour that prompted this redesign.
+      const emergencyInstruction = `
+The deterministic automation harness could not identify a safe long-message field.
 
-As a final fallback:
-1. Locate the message/comments/inquiry field.
-2. Enter the COMPLETE message below in one direct fill/set-value operation whenever possible.
-3. Do NOT type character by character or use a simulated keystroke sequence unless direct fill/set-value is rejected by the site.
-4. Preserve paragraph breaks exactly.
-5. Submit the form and wait for a confirmation.
-If a CAPTCHA is detected, wait for Browserbase CAPTCHA handling to complete.
-If it does not resolve, return: OUTCOME: CAPTCHA_BLOCKED — <captcha type>
+As a last-resort fallback, complete the contact-form task below.
+Use a browser direct fill/set-value action for the message field whenever available.
+Do NOT use character-by-character typing unless the page rejects direct filling.
+Submit the form and wait for the result.
 
 MESSAGE TO ENTER VERBATIM:
 ---BEGIN MESSAGE---
 ${message}
 ---END MESSAGE---
 
+Original task:
+${instructions}
+
 On your FINAL line, print exactly one of:
 OUTCOME: CONFIRMED — <first 200 chars of confirmation>
 OUTCOME: CAPTCHA_BLOCKED — <captcha type>
@@ -669,11 +826,16 @@ OUTCOME: NO_CONFIRMATION — <what the page showed>
 OUTCOME: ERROR — <what went wrong>
 `.trim();
 
-        finalAgentResult = await agent.execute({
-          instruction: emergencyInstruction,
-          maxSteps: 34,
-        });
-      }
+      finalAgentResult = await agent.execute({
+        instruction: emergencyInstruction,
+        maxSteps: 28,
+      });
+    } else {
+      finalAgentResult = {
+        outcome: "MESSAGE_FIELD_NOT_AUTOMATABLE",
+        message:
+          "No safely identifiable editable long-message control was found after deterministic discovery and agent form preparation.",
+      };
     }
 
     const { finalUrl, pageText } = await getFinalPageDetails(page);
@@ -681,15 +843,16 @@ OUTCOME: ERROR — <what went wrong>
     return {
       success: true,
       result: {
-        message: "Stagehand agent finished",
+        message: "Stagehand workflow finished",
         instructionsReceived: instructions,
         urlVisited: targetUrl,
         finalUrl,
         pageText,
         agentResult: finalAgentResult,
-        initialAgentResult,
-        prefill,
+        preparationResult,
+        initialPrefill,
         secondPrefill,
+        messagePrefill: successfulPrefill,
         liveSessionUrl: `https://browserbase.com/sessions/${stagehand.browserbaseSessionID}`,
       },
       error: null,
@@ -722,6 +885,7 @@ app.post("/run", async (req, res) => {
     callback_url,
     job_id,
     shared_secret,
+    allow_agent_message_typing = false,
   } = req.body || {};
 
   if (!instructions) {
@@ -731,7 +895,7 @@ app.post("/run", async (req, res) => {
     });
   }
 
-  // Return immediately; the automation and optional callback continue in background.
+  // Asynchronous job acknowledgment.
   res.json({ accepted: true, job_id });
 
   let result;
@@ -743,6 +907,7 @@ app.post("/run", async (req, res) => {
         instructions,
         message,
         message_paragraphs,
+        allow_agent_message_typing,
       }),
       new Promise((resolve) =>
         setTimeout(
@@ -770,7 +935,13 @@ app.post("/run", async (req, res) => {
   const agentResult = result.result?.agentResult;
 
   if (agentResult) {
-    extraction = getAgentText(agentResult);
+    extraction += agentResultToText(agentResult);
+  }
+
+  if (result.result?.preparationResult) {
+    extraction += `\n\n[preparation_result]\n${agentResultToText(
+      result.result.preparationResult,
+    )}`;
   }
 
   if (result.result?.pageText) {
@@ -781,47 +952,38 @@ app.post("/run", async (req, res) => {
     extraction += `\n\n[final_url] ${result.result.finalUrl}`;
   }
 
-  if (result.result?.prefill) {
-    extraction += `\n\n[prefill]\n${safeStringify({
-      filled: result.result.prefill.filled,
-      locked: result.result.prefill.locked,
-      selector: result.result.prefill.selector,
-      frameUrl: result.result.prefill.frameUrl,
-      frameIndex: result.result.prefill.frameIndex,
-      reason: result.result.prefill.reason,
-      selectionReason: result.result.prefill.selectionReason,
-      verifiedLength: result.result.prefill.verifiedLength,
-      usedSequentialFallback: result.result.prefill.usedSequentialFallback,
-      usableTextareaCount: result.result.prefill.usableTextareaCount,
-    })}`;
-  }
+  for (const key of ["initialPrefill", "secondPrefill", "messagePrefill"]) {
+    const prefill = result.result?.[key];
+    if (!prefill) continue;
 
-  if (result.result?.secondPrefill) {
-    extraction += `\n\n[second_prefill]\n${safeStringify({
-      filled: result.result.secondPrefill.filled,
-      locked: result.result.secondPrefill.locked,
-      selector: result.result.secondPrefill.selector,
-      frameUrl: result.result.secondPrefill.frameUrl,
-      frameIndex: result.result.secondPrefill.frameIndex,
-      reason: result.result.secondPrefill.reason,
-      selectionReason: result.result.secondPrefill.selectionReason,
-      verifiedLength: result.result.secondPrefill.verifiedLength,
-      usedSequentialFallback:
-        result.result.secondPrefill.usedSequentialFallback,
-      usableTextareaCount: result.result.secondPrefill.usableTextareaCount,
+    extraction += `\n\n[${key}]\n${safeStringify({
+      filled: prefill.filled,
+      locked: prefill.locked,
+      method: prefill.method,
+      reason: prefill.reason,
+      selectionReason: prefill.selectionReason,
+      verifiedLength: prefill.verifiedLength,
+      candidate: prefill.candidate,
+      eligibleCount: prefill.eligibleCount,
+      inventory: prefill.inventory?.slice(0, 30),
     })}`;
   }
 
   const { outcome, excerpt } = parseOutcome(extraction);
 
+  const messagePrefill = result.result?.messagePrefill || null;
+
+  const success =
+    outcome === "confirmed" ||
+    (outcome === undefined && result.success && Boolean(messagePrefill?.filled));
+
   console.log("[stagehand] run finished", {
     job_id,
-    success: result.success,
+    success,
     outcome,
     error: result.error,
-    prefillFilled: result.result?.prefill?.filled,
-    prefillLocked: result.result?.prefill?.locked,
-    secondPrefillFilled: result.result?.secondPrefill?.filled,
+    messageFilled: messagePrefill?.filled || false,
+    messageMethod: messagePrefill?.method || null,
   });
 
   try {
@@ -834,45 +996,16 @@ app.post("/run", async (req, res) => {
       },
       body: JSON.stringify({
         job_id,
-        success: outcome === "confirmed" || (outcome === undefined && result.success),
+        success,
         outcome,
         confirmation_excerpt: excerpt,
         extraction,
-        prefill: result.result?.prefill
-          ? {
-              filled: result.result.prefill.filled,
-              locked: result.result.prefill.locked,
-              selector: result.result.prefill.selector,
-              frameUrl: result.result.prefill.frameUrl,
-              frameIndex: result.result.prefill.frameIndex,
-              reason: result.result.prefill.reason,
-              selectionReason: result.result.prefill.selectionReason,
-              verifiedLength: result.result.prefill.verifiedLength,
-              usedSequentialFallback:
-                result.result.prefill.usedSequentialFallback,
-              usableTextareaCount:
-                result.result.prefill.usableTextareaCount,
-            }
-          : null,
-        secondPrefill: result.result?.secondPrefill
-          ? {
-              filled: result.result.secondPrefill.filled,
-              locked: result.result.secondPrefill.locked,
-              selector: result.result.secondPrefill.selector,
-              frameUrl: result.result.secondPrefill.frameUrl,
-              frameIndex: result.result.secondPrefill.frameIndex,
-              reason: result.result.secondPrefill.reason,
-              selectionReason: result.result.secondPrefill.selectionReason,
-              verifiedLength: result.result.secondPrefill.verifiedLength,
-              usedSequentialFallback:
-                result.result.secondPrefill.usedSequentialFallback,
-              usableTextareaCount:
-                result.result.secondPrefill.usableTextareaCount,
-            }
-          : null,
-        liveSessionUrl: result.result?.liveSessionUrl ?? null,
+        messagePrefill,
+        initialPrefill: result.result?.initialPrefill || null,
+        secondPrefill: result.result?.secondPrefill || null,
+        liveSessionUrl: result.result?.liveSessionUrl || null,
         result: result.result,
-        error: result.error ?? null,
+        error: result.error || null,
       }),
     });
 
@@ -885,8 +1018,6 @@ app.post("/run", async (req, res) => {
     console.error("Callback POST failed:", err);
   }
 });
-
-const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`Stagehand service listening on port ${PORT}`);
