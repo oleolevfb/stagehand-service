@@ -69,7 +69,7 @@ Original task:
 ${instructions}
 `.trim();
 
-    const agent = stagehand.agent({ model: "gemini-3.5-flash" });
+    const agent = stagehand.agent({ model: "anthropic/claude-sonnet-4-6" });
 
     const agentResult = await agent.execute({
       instruction: wrappedInstruction,
