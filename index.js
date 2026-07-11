@@ -47,7 +47,6 @@ Your job is to fill out and SUBMIT the contact form on this page.
 
 HARD RULES (DO NOT IGNORE):
 - Preserve all line breaks in any message/textarea field exactly as provided. Do not rephrase, rewrite, or collapse whitespace.
-- If the text you are given contains \\n or \\n\\n, type it exactly as-is into the textarea so the on-page text matches character-for-character.
 - FIRST, paste or fill the entire message into the textarea in one operation (do NOT type it out character by character).
 - AFTER pasting, only make SMALL adjustments if absolutely necessary (e.g. inserting or deleting a line break), but do NOT clear the field and retype the whole message.
 - Never erase the entire message to start over; fix it in-place instead.
@@ -69,7 +68,7 @@ Original task:
 ${instructions}
 `.trim();
 
-    const agent = stagehand.agent({ model: "anthropic/claude-sonnet-4-6" });
+    const agent = stagehand.agent({ model: "anthropic/claude-sonnet-4-5" });
 
     const agentResult = await agent.execute({
       instruction: wrappedInstruction,
