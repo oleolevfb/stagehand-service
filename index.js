@@ -691,6 +691,32 @@ async function runStagehand({
     await stagehand.init();
 
     const page = stagehand.context.pages()[0];
+
+// TEMPORARY DIAGNOSTICS — remove after you send me the Render logs
+try {
+  console.log(
+    "Stagehand version:",
+    require("@browserbasehq/stagehand/package.json").version,
+  );
+} catch (err) {
+  console.log("Could not read Stagehand version:", err.message);
+}
+
+console.log(
+  "page methods:",
+  Object.getOwnPropertyNames(Object.getPrototypeOf(page)),
+);
+
+const testLocator = page.locator("textarea");
+
+console.log(
+  "locator methods:",
+  Object.getOwnPropertyNames(Object.getPrototypeOf(testLocator)),
+);
+
+
+
+    
     const targetUrl = url || "https://example.com";
 
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
