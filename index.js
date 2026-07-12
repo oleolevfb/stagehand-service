@@ -565,7 +565,7 @@ async function runStagehand({
     }
 
     const agent = stagehand.agent({
-      model: "openai/gpt-5.6-terra",
+      model: "anthropic/claude-sonnet-4-6",
     });
 
     let preparationResult = null;
