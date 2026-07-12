@@ -13,6 +13,7 @@ app.get("/", (_req, res) => {
 
 const PORT = process.env.PORT || 3000;
 const HARD_TIMEOUT_MS = 4 * 60 * 1000;
+
 const INITIAL_WAIT_MS = 8000;
 const PREPARE_WAIT_MS = 6000;
 
@@ -48,7 +49,10 @@ function safeStringify(value) {
 }
 
 function trimText(value, max = 1600) {
-  return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
 }
 
 async function waitForEditableControls(page, timeoutMs) {
@@ -89,10 +93,6 @@ async function clickLikelyContactLink(page) {
   }
 }
 
-/*
-  This runs in the browser page, so it can inspect labels, geometry,
-  visibility, attributes, and nearby text without locator.evaluate().
-*/
 async function inspectMainDocumentFields(page) {
   try {
     const fields = await page.evaluate(
@@ -118,9 +118,11 @@ async function inspectMainDocumentFields(page) {
           const placeholder = el.getAttribute("placeholder") || "";
           const ariaLabel = el.getAttribute("aria-label") || "";
           const ariaDescribedBy = el.getAttribute("aria-describedby") || "";
+
           const disabled =
             Boolean(el.disabled) ||
             el.getAttribute("aria-disabled") === "true";
+
           const readOnly =
             Boolean(el.readOnly) ||
             el.getAttribute("aria-readonly") === "true";
@@ -155,8 +157,6 @@ async function inspectMainDocumentFields(page) {
             fieldContainer?.innerText ||
             el.parentElement?.innerText ||
             "";
-
-          const formText = el.closest("form")?.innerText?.slice(0, 1200) || "";
 
           const context = [
             name,
@@ -207,7 +207,6 @@ async function inspectMainDocumentFields(page) {
             role,
             labelText: labelText.trim().slice(0, 400),
             context: context.slice(0, 1200),
-            formText: formText.slice(0, 1200),
             visible,
             disabled,
             readOnly,
@@ -228,7 +227,7 @@ async function inspectMainDocumentFields(page) {
 
     return Array.isArray(fields) ? fields : [];
   } catch (err) {
-    console.error("[stagehand] page field inspection failed:", err.message || err);
+    console.error("[stagehand] main-document field inspection failed:", err.message || err);
     return [];
   }
 }
@@ -243,7 +242,11 @@ function chooseBestMainDocumentField(fields) {
     });
 
   if (!eligible.length) {
-    return { field: null, reason: "no_eligible_main_document_field", eligible };
+    return {
+      field: null,
+      reason: "no_eligible_main_document_field",
+      eligible,
+    };
   }
 
   return {
@@ -334,7 +337,12 @@ async function fillMainDocumentMessage(page, message) {
   }
 
   const locator = page.locator(EDITABLE_SELECTOR).nth(field.index);
-  const fillResult = await tryFillLocator(locator, message, "main_document_locator_fill");
+
+  const fillResult = await tryFillLocator(
+    locator,
+    message,
+    "main_document_locator_fill",
+  );
 
   if (!fillResult.filled) {
     return {
@@ -361,12 +369,6 @@ async function fillMainDocumentMessage(page, message) {
   };
 }
 
-/*
-  Generic cross-frame/shadow-DOM fallback.
-
-  We do not need locator.evaluate() here. deepLocator can search beyond normal
-  DOM boundaries and exposes fill/inputValue according to Stagehand v3.
-*/
 async function fillDeepMessage(page, message) {
   const deepCandidates = [
     "textarea",
@@ -387,17 +389,9 @@ async function fillDeepMessage(page, message) {
 
       for (let index = 0; index < count; index++) {
         const field = locator.nth(index);
-
         const isVisible = await field.isVisible().catch(() => false);
+
         if (!isVisible) continue;
-
-        const text = trimText(
-          await field.textContent().catch(() => ""),
-          800,
-        );
-
-        // Do not use an obviously hidden bot trap or suspicious field.
-        if (HONEYPOT_REGEX.test(text)) continue;
 
         const attempt = await tryFillLocator(
           field,
@@ -451,14 +445,12 @@ async function directFillMessage(page, message, waitMs) {
 
   await waitForEditableControls(page, waitMs);
 
-  // First choice: inspect and score the normal page DOM.
   const mainResult = await fillMainDocumentMessage(page, message);
 
   if (mainResult.filled) {
     return mainResult;
   }
 
-  // Second choice: traverse iframe/shadow boundaries with deepLocator.
   const deepResult = await fillDeepMessage(page, message);
 
   if (deepResult.filled) {
@@ -487,7 +479,7 @@ function parseOutcome(text) {
   if (!text) return { outcome: undefined, excerpt: null };
 
   const match = String(text).match(
-    /OUTCOME:\s*(CONFIRMED|CAPTCHA_BLOCKED|READY_FOR_MESSAGE|MESSAGE_FIELD_NOT_AUTOMATABLE|NO_CONFIRMATION|ERROR)\s*[—:-]?\s*(.{0,500})?/i,
+    /OUTCOME:\s*(CONFIRMED|CAPTCHA_BLOCKED|READY_FOR_MESSAGE|NO_CONFIRMATION|ERROR)\s*[—:-]?\s*(.{0,500})?/i,
   );
 
   if (!match) {
@@ -536,7 +528,7 @@ async function runStagehand({
   instructions,
   message,
   message_paragraphs,
-  allow_agent_message_typing = false,
+  allow_agent_message_typing = true,
 }) {
   let stagehand;
 
@@ -551,8 +543,15 @@ async function runStagehand({
     await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
     await sleep(800);
 
-    // Phase 1: fast deterministic message fill before AI preparation.
-    let initialPrefill = await directFillMessage(page, message, INITIAL_WAIT_MS);
+    /*
+      PHASE 1:
+      Attempt a fast deterministic fill before the agent does anything.
+    */
+    const initialPrefill = await directFillMessage(
+      page,
+      message,
+      INITIAL_WAIT_MS,
+    );
 
     console.log("[stagehand] initial message fill", {
       filled: initialPrefill.filled,
@@ -573,20 +572,24 @@ async function runStagehand({
     let secondPrefill = null;
     let finalAgentResult = null;
 
+    /*
+      PHASE 2:
+      Only when the initial fill fails, prepare the form without submitting.
+      This is temporary: later branches ALWAYS submit.
+    */
     if (message && !initialPrefill.filled) {
-      // Phase 2: the agent prepares the form, never sees the message itself.
       preparationResult = await agent.execute({
         instruction: `
-You are preparing a contact-form submission in a real browser.
+You are preparing a contact form in a real browser.
 
 Your task:
-- Navigate to the relevant contact, inquiry, appointment, or consultation form.
-- Open required modals or accordions and complete any preliminary form step.
-- Fill all required SHORT fields from the original task: name, email, phone, dropdowns, checkboxes, subject, etc.
-- Do NOT fill, clear, click, focus, or edit the message/comments/details/inquiry field.
-- Do NOT submit the form.
+- Navigate to the relevant contact, appointment, consultation, or inquiry form.
+- Open required modals, accordions, tabs, or multi-step form panels.
+- Fill all required SHORT fields from the original task, including name, email, phone, dropdowns, checkboxes, and subject when applicable.
+- Leave the long message/comments/details/inquiry field untouched.
+- Do NOT submit yet. A second automation step will fill the long message.
 
-Stop only when the long message field is visible, enabled, and ready for external automation.
+Stop only once the message field is visible and the rest of the form is ready.
 
 On your FINAL line, print exactly:
 OUTCOME: READY_FOR_MESSAGE — <label, placeholder, or description of the message field>
@@ -601,8 +604,15 @@ ${instructions}
         maxSteps: 28,
       });
 
-      // Phase 3: retry deterministic direct fill after the agent exposed the form.
-      secondPrefill = await directFillMessage(page, message, PREPARE_WAIT_MS);
+      /*
+        PHASE 3:
+        Now the form should be fully open. Try direct fill again.
+      */
+      secondPrefill = await directFillMessage(
+        page,
+        message,
+        PREPARE_WAIT_MS,
+      );
 
       console.log("[stagehand] second message fill", {
         filled: secondPrefill.filled,
@@ -618,41 +628,60 @@ ${instructions}
         ? secondPrefill
         : null;
 
+    /*
+      PHASE 4:
+      Every normal path now submits the form.
+
+      If direct prefill worked, agent submits only.
+      If direct prefill failed, agent receives the message and completes/submits.
+    */
     if (successfulPrefill) {
-      // Phase 4: agent submits only; it never receives the long message.
       finalAgentResult = await agent.execute({
         instruction: `
-You are completing a contact-form submission in a real browser.
+Complete and SUBMIT the contact form in the real browser.
 
 The long message field has already been filled by the automation harness.
 ${successfulPrefill.locked
-  ? "It was intentionally locked. Do NOT click, focus, clear, edit, or retype it."
-  : "Do NOT edit, clear, or retype the message field."}
+  ? "It is intentionally locked. Do NOT click, focus, clear, edit, or retype it."
+  : "Do NOT clear, edit, or retype the existing message."}
 
 Your task:
-- Check that the other required fields are complete.
-- Submit/send the form.
-- Wait for and inspect the result.
-- If a CAPTCHA is shown, wait briefly for any configured browser handling. If it remains unresolved, report it.
+1. Verify all other required fields are completed.
+2. Click the actual submit/send/request/appointment button.
+3. Wait for the form to finish processing.
+4. Inspect the resulting page, success message, redirect, or inline confirmation.
+5. If a CAPTCHA is shown, wait briefly for configured browser handling. If it remains unresolved, report it.
 
 On your FINAL line, print exactly one of:
 OUTCOME: CONFIRMED — <first 200 chars of confirmation>
 OUTCOME: CAPTCHA_BLOCKED — <captcha type>
-OUTCOME: NO_CONFIRMATION — <what the page showed>
+OUTCOME: NO_CONFIRMATION — <what the page showed after submit>
 OUTCOME: ERROR — <what went wrong>
 `.trim(),
-        maxSteps: 16,
+        maxSteps: 20,
       });
-    } else if (allow_agent_message_typing && message) {
-      // Explicit opt-in only. Default is false to prevent slow AI typing.
+    } else if (message && allow_agent_message_typing) {
+      /*
+        This is now the DEFAULT fallback.
+
+        The agent receives the message only after both deterministic fill attempts
+        fail. It is explicitly instructed to complete and submit the form.
+      */
       finalAgentResult = await agent.execute({
         instruction: `
-The deterministic automation harness could not find a safe editable message field.
+Complete and SUBMIT the contact form in the real browser.
 
-As an explicitly authorized last fallback, complete the contact-form task.
-Enter the full message below using a direct browser fill/set-value operation
-whenever your tools allow it. Do NOT use character-by-character typing unless
-direct filling is rejected by the website.
+The automation harness could not reliably identify or directly fill the long
+message field. You must now finish the task yourself:
+
+1. Locate the message/comments/details/inquiry field.
+2. Enter the message below exactly, preserving paragraph breaks.
+3. Fill any remaining required fields from the original task.
+4. Click the actual submit/send/request/appointment button.
+5. Wait for and inspect the confirmation, redirect, or inline success state.
+
+Use a direct browser fill/set-value action for the message whenever available.
+Do NOT use character-by-character typing unless the website rejects direct fill.
 
 MESSAGE TO ENTER VERBATIM:
 ---BEGIN MESSAGE---
@@ -665,16 +694,20 @@ ${instructions}
 On your FINAL line, print exactly one of:
 OUTCOME: CONFIRMED — <first 200 chars of confirmation>
 OUTCOME: CAPTCHA_BLOCKED — <captcha type>
-OUTCOME: NO_CONFIRMATION — <what the page showed>
+OUTCOME: NO_CONFIRMATION — <what the page showed after submit>
 OUTCOME: ERROR — <what went wrong>
 `.trim(),
-        maxSteps: 28,
+        maxSteps: 35,
       });
     } else {
+      /*
+        This can only happen when no message exists or agent fallback has been
+        deliberately disabled in the request.
+      */
       finalAgentResult = {
-        outcome: "MESSAGE_FIELD_NOT_AUTOMATABLE",
+        outcome: "ERROR",
         message:
-          "No safely identifiable long-message field could be directly filled after the initial scan and form-preparation pass.",
+          "Message prefill failed and agent message fallback is disabled or no message was provided.",
       };
     }
 
@@ -725,7 +758,7 @@ app.post("/run", async (req, res) => {
     callback_url,
     job_id,
     shared_secret,
-    allow_agent_message_typing = false,
+    allow_agent_message_typing = true,
   } = req.body || {};
 
   if (!instructions) {
@@ -735,7 +768,6 @@ app.post("/run", async (req, res) => {
     });
   }
 
-  // Acknowledge immediately; run the browser job asynchronously.
   res.json({ accepted: true, job_id });
 
   let result;
@@ -814,9 +846,7 @@ app.post("/run", async (req, res) => {
 
   const success =
     outcome === "confirmed" ||
-    (outcome === undefined &&
-      result.success &&
-      Boolean(messagePrefill?.filled));
+    (outcome === undefined && result.success);
 
   console.log("[stagehand] run finished", {
     job_id,
