@@ -565,7 +565,7 @@ async function runStagehand({
     }
 
     const agent = stagehand.agent({
-      model: "anthropic/claude-sonnet-4-6",
+      model: "google/gemini-3.5-flash",
     });
 
     let preparationResult = null;
