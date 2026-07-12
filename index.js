@@ -565,7 +565,7 @@ async function runStagehand({
     }
 
     const agent = stagehand.agent({
-      model: "google/gemini-3.5-flash",
+      model: "openai/gpt-5.5",
     });
 
     let preparationResult = null;
