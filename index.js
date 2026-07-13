@@ -4,40 +4,276 @@ const express = require("express");
 const { Stagehand } = require("@browserbasehq/stagehand");
 
 const app = express();
-
 app.use(express.json({ limit: "2mb" }));
 
-app.get("/", (_req, res) => {
-  res.send("Stagehand service is running");
-});
-
-const PORT = process.env.PORT || 3000;
-const HARD_TIMEOUT_MS = 4 * 60 * 1000;
-
-const INITIAL_WAIT_MS = 8000;
-const PREPARE_WAIT_MS = 6000;
-
-const EDITABLE_SELECTOR = [
-  "textarea",
-  "[contenteditable='true']",
-  "[role='textbox']",
-  ".ProseMirror",
-  ".ql-editor",
-  ".public-DraftEditor-content",
-  "[data-lexical-editor='true']",
-].join(", ");
+app.get("/", (_req, res) => res.send("Stagehand service is running"));
 
 const MESSAGE_REGEX =
-  /message|comments?|inquir(?:y|ies)|questions?|details|notes|tell us|how can we help|your\s*message|additional\s*(?:info|information)|describe|reason\s*(?:for|of)|anything\s*else|enquiry/i;
+  /message|comments?|inquiry|inquiries|questions?|details|notes|how can we help|tell us|your\s*message/i;
 
-const HONEYPOT_REGEX =
-  /honeypot|url2|trap|bot|website\b|company_website|confirm_email|email_confirm/i;
+const HONEYPOT_REGEX = /honeypot|url2|trap|bot|website\b/i;
 
-const CONTACT_LINK_REGEX =
-  /contact|reach us|inquir|appointment|consultation|get in touch|request|book/i;
+const HARD_TIMEOUT_MS = 4 * 60 * 1000;
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function prefillMessageTextarea(page, message, messageParagraphs) {
+  if (!message) {
+    return {
+      filled: false,
+      locked: false,
+      selector: null,
+      reason: "no_message",
+      verifiedLength: 0,
+      usedFallback: false,
+      candidates: [],
+    };
+  }
+
+  const waitForAny = async (ms) => {
+    try {
+      await page.waitForSelector("textarea", {
+        timeout: ms,
+        state: "visible",
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  let found = await waitForAny(8000);
+
+  if (!found) {
+    try {
+      const contactLink = page
+        .getByRole("link", {
+          name: /contact|reach us|inquire|appointment|consultation|get in touch/i,
+        })
+        .first();
+
+      if (await contactLink.count()) {
+        await contactLink.click({ timeout: 5000 }).catch(() => {});
+        await page.waitForLoadState("domcontentloaded").catch(() => {});
+      }
+    } catch {}
+
+    found = await waitForAny(8000);
+  }
+
+  if (!found) {
+    return {
+      filled: false,
+      locked: false,
+      selector: null,
+      reason: "no_textarea",
+      verifiedLength: 0,
+      usedFallback: false,
+      candidates: [],
+    };
+  }
+
+  const candidates = await page.$$eval(
+    "textarea",
+    (nodes, rx) => {
+      const messageRe = new RegExp(rx.message, "i");
+      const honeypotRe = new RegExp(rx.honeypot, "i");
+
+      return nodes.map((el, idx) => {
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+
+        const visible =
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          rect.width > 0 &&
+          rect.height > 0;
+
+        const name = el.getAttribute("name") || "";
+        const id = el.getAttribute("id") || "";
+        const placeholder = el.getAttribute("placeholder") || "";
+        const aria = el.getAttribute("aria-label") || "";
+
+        let labelText = "";
+
+        if (id) {
+          const label = document.querySelector(
+            `label[for="${CSS.escape(id)}"]`,
+          );
+
+          if (label) {
+            labelText = label.textContent || "";
+          }
+        }
+
+        if (!labelText && el.parentElement) {
+          const label = el.parentElement.querySelector("label");
+
+          if (label) {
+            labelText = label.textContent || "";
+          }
+        }
+
+        const haystack = `${name} ${id} ${placeholder} ${aria} ${labelText}`;
+
+        let score = 0;
+
+        if (messageRe.test(haystack)) score += 5;
+        if (messageRe.test(labelText)) score += 3;
+
+        const rows = parseInt(el.getAttribute("rows") || "0", 10) || 0;
+        const cols = parseInt(el.getAttribute("cols") || "0", 10) || 0;
+
+        score += Math.min(5, Math.floor((rows * cols) / 100));
+
+        if (!visible) score -= 20;
+        if (el.hasAttribute("readonly") || el.hasAttribute("disabled")) {
+          score -= 20;
+        }
+
+        if (honeypotRe.test(haystack)) score -= 20;
+
+        let selector = "";
+
+        if (id) {
+          selector = `textarea#${CSS.escape(id)}`;
+        } else if (name) {
+          selector = `textarea[name="${name}"]`;
+        } else {
+          selector = `textarea >> nth=${idx}`;
+        }
+
+        return {
+          idx,
+          selector,
+          score,
+          visible,
+          name,
+          id,
+          placeholder,
+          labelText,
+        };
+      });
+    },
+    {
+      message: MESSAGE_REGEX.source,
+      honeypot: HONEYPOT_REGEX.source,
+    },
+  );
+
+  const best = candidates
+    .filter((candidate) => candidate.score > 0)
+    .sort((a, b) => b.score - a.score)[0];
+
+  if (!best) {
+    return {
+      filled: false,
+      locked: false,
+      selector: null,
+      reason: "no_matching_textarea",
+      verifiedLength: 0,
+      usedFallback: false,
+      candidates,
+    };
+  }
+
+  const loc = page.locator(best.selector).first();
+
+  let filled = false;
+  let usedFallback = false;
+  let reason = "unknown";
+  let verifiedLength = 0;
+
+  try {
+    await loc.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
+    await loc.click({ timeout: 3000 }).catch(() => {});
+    await loc.fill("", { timeout: 3000 }).catch(() => {});
+    await loc.fill(message, { timeout: 8000 });
+
+    const got = await loc.inputValue().catch(() => "");
+    verifiedLength = got.length;
+
+    if (got && got.length >= Math.min(20, message.length)) {
+      filled = true;
+      reason = "fill_ok";
+    } else {
+      usedFallback = true;
+
+      await loc.fill("").catch(() => {});
+      await loc.click({ timeout: 3000 }).catch(() => {});
+
+      const paragraphs =
+        Array.isArray(messageParagraphs) && messageParagraphs.length
+          ? messageParagraphs
+          : message.split(/\n{2,}/g);
+
+      for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
+        const lines = String(paragraphs[paragraphIndex]).split("\n");
+
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+          await loc.pressSequentially(lines[lineIndex], { delay: 5 });
+
+          if (lineIndex < lines.length - 1) {
+            await page.keyboard.press("Shift+Enter");
+          }
+        }
+
+        if (paragraphIndex < paragraphs.length - 1) {
+          await page.keyboard.press("Enter");
+          await page.keyboard.press("Enter");
+        }
+      }
+
+      const got2 = await loc.inputValue().catch(() => "");
+      verifiedLength = got2.length;
+      filled = got2.length > 0;
+
+      reason = filled
+        ? "sequential_ok"
+        : "fill_and_sequential_failed";
+    }
+  } catch (err) {
+    return {
+      filled: false,
+      locked: false,
+      selector: best.selector,
+      reason: `fill_error: ${err.message || err}`,
+      verifiedLength,
+      usedFallback,
+      candidates,
+    };
+  }
+
+  let locked = false;
+
+  if (filled) {
+    try {
+      locked = await loc.evaluate((el) => {
+        try {
+          el.setAttribute("data-lovable-prefilled", "1");
+          el.readOnly = true;
+
+          if (typeof el.blur === "function") {
+            el.blur();
+          }
+
+          return true;
+        } catch {
+          return false;
+        }
+      });
+    } catch {
+      locked = false;
+    }
+  }
+
+  return {
+    filled,
+    locked,
+    selector: best.selector,
+    reason,
+    verifiedLength,
+    usedFallback,
+    candidates,
+  };
 }
 
 function safeStringify(value) {
@@ -48,552 +284,136 @@ function safeStringify(value) {
   }
 }
 
-function trimText(value, max = 1600) {
-  return String(value || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, max);
-}
+/*
+  Converts a Stagehand agent result into text, but does not mix it with:
+  - prompts
+  - original instructions
+  - page diagnostics
+  - callback diagnostics
+  - agent transcript history
 
-async function waitForEditableControls(page, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
+  This is important because instructions themselves contain the literal
+  text "OUTCOME: CONFIRMED", which must never be treated as proof of success.
+*/
+function agentResultToText(agentResult) {
+  if (agentResult == null) return "";
 
-  while (Date.now() < deadline) {
-    try {
-      const count = await page.locator(EDITABLE_SELECTOR).count();
-      if (count > 0) return true;
-    } catch {}
-
-    try {
-      const deepCount = await page.deepLocator(EDITABLE_SELECTOR).count();
-      if (deepCount > 0) return true;
-    } catch {}
-
-    await sleep(400);
+  if (typeof agentResult === "string") {
+    return agentResult;
   }
 
-  return false;
-}
+  if (typeof agentResult === "object") {
+    const preferredFields = [
+      "text",
+      "message",
+      "output",
+      "content",
+      "result",
+      "final",
+      "completion",
+    ];
 
-async function clickLikelyContactLink(page) {
-  try {
-    const contactLink = page
-      .getByRole("link", { name: CONTACT_LINK_REGEX })
-      .first();
+    for (const field of preferredFields) {
+      const value = agentResult[field];
 
-    if (!(await contactLink.count())) return false;
-
-    await contactLink.click({ timeout: 5000 }).catch(() => {});
-    await page
-      .waitForLoadState("domcontentloaded", { timeout: 8000 })
-      .catch(() => {});
-    await sleep(1000);
-
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function inspectMainDocumentFields(page) {
-  try {
-    const fields = await page.evaluate(
-      ({ selector, messageRegexSource, honeypotRegexSource }) => {
-        const messageRe = new RegExp(messageRegexSource, "i");
-        const honeypotRe = new RegExp(honeypotRegexSource, "i");
-
-        return [...document.querySelectorAll(selector)].map((el, index) => {
-          const style = window.getComputedStyle(el);
-          const rect = el.getBoundingClientRect();
-
-          const visible =
-            style.display !== "none" &&
-            style.visibility !== "hidden" &&
-            style.opacity !== "0" &&
-            rect.width > 0 &&
-            rect.height > 0;
-
-          const tag = el.tagName.toLowerCase();
-          const role = el.getAttribute("role") || "";
-          const id = el.getAttribute("id") || "";
-          const name = el.getAttribute("name") || "";
-          const placeholder = el.getAttribute("placeholder") || "";
-          const ariaLabel = el.getAttribute("aria-label") || "";
-          const ariaDescribedBy = el.getAttribute("aria-describedby") || "";
-
-          const disabled =
-            Boolean(el.disabled) ||
-            el.getAttribute("aria-disabled") === "true";
-
-          const readOnly =
-            Boolean(el.readOnly) ||
-            el.getAttribute("aria-readonly") === "true";
-
-          let labelText = "";
-
-          if (id) {
-            const explicitLabel = document.querySelector(
-              `label[for="${CSS.escape(id)}"]`,
-            );
-            if (explicitLabel) labelText = explicitLabel.textContent || "";
-          }
-
-          if (!labelText) {
-            const wrappingLabel = el.closest("label");
-            if (wrappingLabel) labelText = wrappingLabel.textContent || "";
-          }
-
-          let describedByText = "";
-
-          for (const describedId of ariaDescribedBy.split(/\s+/).filter(Boolean)) {
-            const description = document.getElementById(describedId);
-            if (description) {
-              describedByText += ` ${description.textContent || ""}`;
-            }
-          }
-
-          const fieldContainer = el.closest(
-            ".gfield, .form-group, .field, .field-wrap, .form-field, .hs-form-field, .wpcf7-form-control-wrap, li, p, fieldset, [data-field]",
-          );
-
-          const nearbyText =
-            fieldContainer?.innerText ||
-            el.parentElement?.innerText ||
-            "";
-
-          const context = [
-            name,
-            id,
-            placeholder,
-            ariaLabel,
-            describedByText,
-            labelText,
-            nearbyText,
-            role,
-          ]
-            .join(" ")
-            .replace(/\s+/g, " ")
-            .trim();
-
-          const rows =
-            Number.parseInt(el.getAttribute("rows") || "0", 10) || 0;
-
-          let score = 0;
-
-          if (tag === "textarea") score += 12;
-          if (el.isContentEditable || role === "textbox") score += 8;
-          if (messageRe.test(context)) score += 18;
-          if (messageRe.test(labelText)) score += 7;
-          if (messageRe.test(placeholder)) score += 5;
-          if (messageRe.test(name) || messageRe.test(id)) score += 5;
-          if (rect.height >= 80) score += 8;
-          if (rows >= 3) score += 5;
-
-          if (!visible) score -= 50;
-          if (disabled || readOnly) score -= 50;
-          if (honeypotRe.test(context)) score -= 50;
-
-          const eligible =
-            visible &&
-            !disabled &&
-            !readOnly &&
-            !honeypotRe.test(context) &&
-            (score >= 10 || tag === "textarea" || el.isContentEditable);
-
-          return {
-            index,
-            tag,
-            id,
-            name,
-            placeholder,
-            ariaLabel,
-            role,
-            labelText: labelText.trim().slice(0, 400),
-            context: context.slice(0, 1200),
-            visible,
-            disabled,
-            readOnly,
-            width: Math.round(rect.width),
-            height: Math.round(rect.height),
-            rows,
-            score,
-            eligible,
-          };
-        });
-      },
-      {
-        selector: EDITABLE_SELECTOR,
-        messageRegexSource: MESSAGE_REGEX.source,
-        honeypotRegexSource: HONEYPOT_REGEX.source,
-      },
-    );
-
-    return Array.isArray(fields) ? fields : [];
-  } catch (err) {
-    console.error(
-      "[stagehand] main-document field inspection failed:",
-      err.message || err,
-    );
-
-    return [];
-  }
-}
-
-function chooseBestMainDocumentField(fields) {
-  const eligible = fields
-    .filter((field) => field.eligible)
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      if (b.height !== a.height) return b.height - a.height;
-      return a.index - b.index;
-    });
-
-  if (!eligible.length) {
-    return {
-      field: null,
-      reason: "no_eligible_main_document_field",
-      eligible,
-    };
-  }
-
-  return {
-    field: eligible[0],
-    reason: "highest_scoring_main_document_field",
-    eligible,
-  };
-}
-
-async function tryFillLocator(locator, message, source) {
-  const minLength = Math.min(20, String(message).length);
-
-  try {
-    await locator.scrollTo({ timeout: 5000 }).catch(() => {});
-    await locator.fill(message, { timeout: 12000 });
-
-    const value = await locator.inputValue().catch(() => "");
-
-    if (value.length >= minLength) {
-      return {
-        filled: true,
-        method: source,
-        verifiedLength: value.length,
-      };
-    }
-
-    return {
-      filled: false,
-      method: source,
-      verifiedLength: value.length,
-      reason: "value_verification_failed",
-    };
-  } catch (err) {
-    return {
-      filled: false,
-      method: source,
-      verifiedLength: 0,
-      reason: `fill_error: ${err.message || err}`,
-    };
-  }
-}
-
-async function lockMainDocumentField(page, index) {
-  try {
-    return await page.evaluate(
-      ({ selector, index }) => {
-        const element = document.querySelectorAll(selector)[index];
-
-        if (!element) return false;
-
-        try {
-          element.setAttribute("data-lovable-prefilled", "1");
-
-          if ("readOnly" in element) {
-            element.readOnly = true;
-          } else {
-            element.setAttribute("contenteditable", "false");
-            element.setAttribute("aria-readonly", "true");
-          }
-
-          if (typeof element.blur === "function") element.blur();
-
-          return true;
-        } catch {
-          return false;
-        }
-      },
-      { selector: EDITABLE_SELECTOR, index },
-    );
-  } catch {
-    return false;
-  }
-}
-
-async function fillMainDocumentMessage(page, message) {
-  const fields = await inspectMainDocumentFields(page);
-  const { field, reason, eligible } = chooseBestMainDocumentField(fields);
-
-  if (!field) {
-    return {
-      filled: false,
-      locked: false,
-      source: "main_document",
-      reason,
-      eligibleCount: eligible.length,
-      inventory: fields,
-    };
-  }
-
-  const locator = page.locator(EDITABLE_SELECTOR).nth(field.index);
-
-  const fillResult = await tryFillLocator(
-    locator,
-    message,
-    "main_document_locator_fill",
-  );
-
-  if (!fillResult.filled) {
-    return {
-      ...fillResult,
-      locked: false,
-      source: "main_document",
-      reason: fillResult.reason || reason,
-      field,
-      eligibleCount: eligible.length,
-      inventory: fields,
-    };
-  }
-
-  const locked = await lockMainDocumentField(page, field.index);
-
-  return {
-    ...fillResult,
-    locked,
-    source: "main_document",
-    selectionReason: reason,
-    field,
-    eligibleCount: eligible.length,
-    inventory: fields,
-  };
-}
-
-async function fillDeepMessage(page, message) {
-  const deepCandidates = [
-    "textarea",
-    "[contenteditable='true']",
-    "[role='textbox']",
-    ".ProseMirror",
-    ".ql-editor",
-    ".public-DraftEditor-content",
-    "[data-lexical-editor='true']",
-  ];
-
-  const attempts = [];
-
-  for (const selector of deepCandidates) {
-    try {
-      const locator = page.deepLocator(selector);
-      const count = await locator.count().catch(() => 0);
-
-      for (let index = 0; index < count; index++) {
-        const field = locator.nth(index);
-        const isVisible = await field.isVisible().catch(() => false);
-
-        if (!isVisible) continue;
-
-        const attempt = await tryFillLocator(
-          field,
-          message,
-          `deep_locator_fill:${selector}:${index}`,
-        );
-
-        attempts.push({
-          selector,
-          index,
-          visible: isVisible,
-          ...attempt,
-        });
-
-        if (attempt.filled) {
-          return {
-            ...attempt,
-            locked: false,
-            source: "deep_locator",
-            selectionReason: "cross_frame_or_shadow_dom_fallback",
-            attempts,
-          };
-        }
+      if (typeof value === "string" && value.trim()) {
+        return value;
       }
-    } catch (err) {
-      attempts.push({
-        selector,
-        filled: false,
-        reason: `deep_locator_error: ${err.message || err}`,
-      });
+    }
+
+    try {
+      return JSON.stringify(agentResult);
+    } catch {
+      return String(agentResult);
     }
   }
 
-  return {
-    filled: false,
-    locked: false,
-    source: "deep_locator",
-    reason: "no_deep_locator_candidate_could_be_filled",
-    attempts,
-  };
-}
-
-async function directFillMessage(page, message, waitMs) {
-  if (!message) {
-    return {
-      filled: false,
-      locked: false,
-      reason: "no_message",
-    };
-  }
-
-  await waitForEditableControls(page, waitMs);
-
-  const mainResult = await fillMainDocumentMessage(page, message);
-
-  if (mainResult.filled) {
-    return mainResult;
-  }
-
-  const deepResult = await fillDeepMessage(page, message);
-
-  if (deepResult.filled) {
-    return {
-      ...deepResult,
-      mainDocumentFailure: {
-        reason: mainResult.reason,
-        inventory: mainResult.inventory?.slice(0, 30),
-      },
-    };
-  }
-
-  return {
-    filled: false,
-    locked: false,
-    reason: "all_deterministic_message_fill_strategies_failed",
-    mainDocumentFailure: {
-      reason: mainResult.reason,
-      inventory: mainResult.inventory?.slice(0, 30),
-    },
-    deepLocatorFailure: deepResult,
-  };
+  return String(agentResult);
 }
 
 /*
-  Internal statuses remain detailed so the code can distinguish:
-  confirmed, captcha_blocked, no_confirmation, agent error, etc.
+  Only accept an outcome if it appears as a standalone line near the end
+  of the final agent response.
 
-  Lovable receives only:
-  outcome: SUCCESS | FAILED
+  This prevents false matches from:
+  - the prompt's "OUTCOME: CONFIRMED" example
+  - internal agent reasoning
+  - pasted transcript/history
+  - diagnostic logs
 */
-function parseInternalOutcome(text) {
+function parseTrustedOutcome(agentText) {
+  const text = String(agentText || "").trim();
+
   if (!text) {
     return {
-      internalOutcome: undefined,
+      outcome: undefined,
       excerpt: null,
+      matchedLine: null,
     };
   }
 
-  const match = String(text).match(
-    /OUTCOME:\s*(CONFIRMED|CAPTCHA_BLOCKED|READY_FOR_MESSAGE|NO_CONFIRMATION|ERROR)\s*[—:-]?\s*(.{0,500})?/i,
-  );
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
 
-  if (!match) {
+  const finalLines = lines.slice(-8).reverse();
+
+  for (const line of finalLines) {
+    const match = line.match(
+      /^OUTCOME:\s*(CONFIRMED|CAPTCHA_BLOCKED|NO_CONFIRMATION|ERROR)\s*(?:—|--|:|-)?\s*(.*)$/i,
+    );
+
+    if (!match) continue;
+
     return {
-      internalOutcome: undefined,
-      excerpt: null,
+      outcome: match[1].toLowerCase(),
+      excerpt: (match[2] || "").trim().slice(0, 300) || null,
+      matchedLine: line,
     };
   }
 
   return {
-    internalOutcome: match[1].toLowerCase(),
-    excerpt: (match[2] || "").trim().slice(0, 300) || null,
+    outcome: undefined,
+    excerpt: null,
+    matchedLine: null,
   };
 }
 
-function agentResultToText(agentResult) {
-  if (!agentResult) return "";
-  if (typeof agentResult === "string") return agentResult;
+function buildExtraction(result) {
+  const agentResult = result?.result?.agentResult;
+  const agentText = agentResultToText(agentResult);
 
-  return [
-    agentResult.message,
-    agentResult.result,
-    agentResult.output,
-    agentResult.text,
-    agentResult.summary,
-    safeStringify(agentResult),
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
+  let extraction = "";
 
-function buildBinaryResult({ internalOutcome, excerpt, resultError }) {
-  const confirmed = internalOutcome === "confirmed";
-
-  if (confirmed) {
-    return {
-      outcome: "SUCCESS",
-      reason: "confirmed",
-      message:
-        excerpt ||
-        "The website displayed a submission confirmation.",
-      confirmationExcerpt: excerpt || null,
-    };
+  if (agentText) {
+    extraction += `[agent_final_result]\n${agentText}`;
   }
 
-  if (resultError === "render_hard_timeout_4min") {
-    return {
-      outcome: "FAILED",
-      reason: "timeout",
-      message: "The browser workflow exceeded the 4-minute time limit.",
-      confirmationExcerpt: null,
-    };
+  if (result?.result?.pageText) {
+    extraction += `\n\n[final_page_text]\n${result.result.pageText}`;
   }
 
-  const reasonMap = {
-    captcha_blocked: "captcha_blocked",
-    no_confirmation: "no_confirmation",
-    error: "agent_error",
-    ready_for_message: "message_fill_failed",
-  };
+  if (result?.result?.finalUrl) {
+    extraction += `\n\n[final_url]\n${result.result.finalUrl}`;
+  }
 
-  const reason = reasonMap[internalOutcome] || "unknown";
+  if (result?.result?.prefill) {
+    extraction += `\n\n[prefill]\n${safeStringify({
+      filled: result.result.prefill.filled,
+      locked: result.result.prefill.locked,
+      selector: result.result.prefill.selector,
+      reason: result.result.prefill.reason,
+      verifiedLength: result.result.prefill.verifiedLength,
+      usedFallback: result.result.prefill.usedFallback,
+    })}`;
+  }
 
-  const defaultMessages = {
-    captcha_blocked: "The form could not be submitted because a CAPTCHA blocked progress.",
-    no_confirmation:
-      "The form may have been submitted, but no visible confirmation could be verified.",
-    agent_error: "The browser agent reported an error while completing the form.",
-    message_fill_failed:
-      "The form was prepared, but the message field could not be completed.",
-    unknown:
-      "The submission could not be verified as successful.",
-  };
+  if (result?.error) {
+    extraction += `\n\n[run_error]\n${result.error}`;
+  }
 
-  return {
-    outcome: "FAILED",
-    reason,
-    message: excerpt || resultError || defaultMessages[reason],
-    confirmationExcerpt: null,
-  };
-}
-
-async function getFinalPageDetails(page) {
-  let finalUrl = "";
-  let pageText = "";
-
-  try {
-    finalUrl = page.url();
-  } catch {}
-
-  try {
-    pageText = (await page.locator("body").innerText()).slice(0, 2500);
-  } catch {}
-
-  return { finalUrl, pageText };
+  return extraction.trim();
 }
 
 async function runStagehand({
@@ -601,7 +421,6 @@ async function runStagehand({
   instructions,
   message,
   message_paragraphs,
-  allow_agent_message_typing = true,
 }) {
   let stagehand;
 
@@ -612,165 +431,87 @@ async function runStagehand({
     const page = stagehand.context.pages()[0];
     const targetUrl = url || "https://example.com";
 
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-    await page
-      .waitForLoadState("networkidle", { timeout: 10000 })
-      .catch(() => {});
-    await sleep(800);
-
-    const initialPrefill = await directFillMessage(
-      page,
-      message,
-      INITIAL_WAIT_MS,
-    );
-
-    console.log("[stagehand] initial message fill", {
-      filled: initialPrefill.filled,
-      method: initialPrefill.method,
-      source: initialPrefill.source,
-      reason: initialPrefill.reason,
+    await page.goto(targetUrl, {
+      waitUntil: "domcontentloaded",
     });
 
-    if (!initialPrefill.filled) {
-      await clickLikelyContactLink(page);
-    }
+    const prefill = await prefillMessageTextarea(
+      page,
+      message,
+      message_paragraphs,
+    );
+
+    console.log("[stagehand] prefill result", {
+      filled: prefill.filled,
+      locked: prefill.locked,
+      selector: prefill.selector,
+      reason: prefill.reason,
+      verifiedLength: prefill.verifiedLength,
+      usedFallback: prefill.usedFallback,
+    });
+
+    const messageNote =
+      prefill.filled && prefill.locked
+        ? `The message/comments/inquiry textarea has ALREADY BEEN FILLED and LOCKED for you by the automation harness (selector "${prefill.selector}"). DO NOT navigate to the current page URL, refresh the page, click the message field, focus it, clear it, retype it, or edit it. It is intentionally readOnly and will submit correctly as-is. Fill ONLY the other fields and submit the form.`
+        : prefill.filled
+          ? `The message textarea has already been filled by the automation harness but could not be locked. Do NOT navigate to the current page URL, refresh, retype, or edit that message. Fill only the other fields and submit.`
+          : `The message textarea could NOT be pre-filled automatically (reason: ${prefill.reason}). Locate the message/comments field yourself and paste the message verbatim before submitting.`;
+
+    const wrappedInstruction = `
+You are a browser automation agent controlling a real browser.
+
+Your job is to fill out and SUBMIT the contact form on this page.
+
+${messageNote}
+
+HARD RULES:
+- Do NOT call page.goto(), navigate to the current page URL, or refresh the page unless the user explicitly requires navigation to another page.
+- Fill every required field before submitting.
+- Click the actual submit/send/request-appointment button at the end.
+- After clicking submit, wait and observe the result.
+- A successful submission requires visible evidence on the resulting page, such as a confirmation message, thank-you page, success state, or a clear submission confirmation.
+- Do NOT claim confirmation merely because the form button was clicked.
+- If the form was not submitted, validation failed, required data is missing, or no visible confirmation was observed, report NO_CONFIRMATION or ERROR.
+- Your final non-empty line MUST be exactly one of these forms:
+  OUTCOME: CONFIRMED — <first 200 characters of visible confirmation>
+  OUTCOME: CAPTCHA_BLOCKED — <captcha type>
+  OUTCOME: NO_CONFIRMATION — <what the page showed after the submit attempt>
+  OUTCOME: ERROR — <what went wrong>
+
+Original task:
+${instructions}
+`.trim();
 
     const agent = stagehand.agent({
       model: "anthropic/claude-sonnet-4-6",
     });
 
-    let preparationResult = null;
-    let secondPrefill = null;
-    let finalAgentResult = null;
+    const agentResult = await agent.execute({
+      instruction: wrappedInstruction,
+      maxSteps: 35,
+    });
 
-    if (message && !initialPrefill.filled) {
-      preparationResult = await agent.execute({
-        instruction: `
-You are preparing a contact form in a real browser.
+    let finalUrl = "";
+    let pageText = "";
 
-Your task:
-- Navigate to the relevant contact, appointment, consultation, or inquiry form.
-- Open required modals, accordions, tabs, or multi-step form panels.
-- Fill all required SHORT fields from the original task, including name, email, phone, dropdowns, checkboxes, and subject when applicable.
-- Leave the long message/comments/details/inquiry field untouched.
-- Do NOT submit yet. A second automation step will fill the long message.
+    try {
+      finalUrl = page.url();
+    } catch {}
 
-Stop only once the message field is visible and the rest of the form is ready.
-
-On your FINAL line, print exactly:
-OUTCOME: READY_FOR_MESSAGE — <label, placeholder, or description of the message field>
-or:
-OUTCOME: CAPTCHA_BLOCKED — <captcha type>
-or:
-OUTCOME: ERROR — <what prevented preparation>
-
-Original task:
-${instructions}
-`.trim(),
-        maxSteps: 28,
-      });
-
-      secondPrefill = await directFillMessage(
-        page,
-        message,
-        PREPARE_WAIT_MS,
-      );
-
-      console.log("[stagehand] second message fill", {
-        filled: secondPrefill.filled,
-        method: secondPrefill.method,
-        source: secondPrefill.source,
-        reason: secondPrefill.reason,
-      });
-    }
-
-    const successfulPrefill = initialPrefill.filled
-      ? initialPrefill
-      : secondPrefill?.filled
-        ? secondPrefill
-        : null;
-
-    if (successfulPrefill) {
-      finalAgentResult = await agent.execute({
-        instruction: `
-Complete and SUBMIT the contact form in the real browser.
-
-The long message field has already been filled by the automation harness.
-${successfulPrefill.locked
-  ? "It is intentionally locked. Do NOT click, focus, clear, edit, or retype it."
-  : "Do NOT clear, edit, or retype the existing message."}
-
-Your task:
-1. Verify all other required fields are completed.
-2. Click the actual submit/send/request/appointment button.
-3. Wait for the form to finish processing.
-4. Inspect the resulting page, success message, redirect, or inline confirmation.
-5. If a CAPTCHA is shown, wait briefly for configured browser handling. If it remains unresolved, report it.
-
-On your FINAL line, print exactly one of:
-OUTCOME: CONFIRMED — <first 200 chars of visible confirmation>
-OUTCOME: CAPTCHA_BLOCKED — <captcha type>
-OUTCOME: NO_CONFIRMATION — <what the page showed after submit>
-OUTCOME: ERROR — <what went wrong>
-`.trim(),
-        maxSteps: 20,
-      });
-    } else if (message && allow_agent_message_typing) {
-      finalAgentResult = await agent.execute({
-        instruction: `
-Complete and SUBMIT the contact form in the real browser.
-
-The automation harness could not reliably identify or directly fill the long
-message field. You must now finish the task yourself:
-
-1. Locate the message/comments/details/inquiry field.
-2. Enter the message below exactly, preserving paragraph breaks.
-3. Fill any remaining required fields from the original task.
-4. Click the actual submit/send/request/appointment button.
-5. Wait for and inspect the confirmation, redirect, or inline success state.
-
-Use a direct browser fill/set-value action for the message whenever available.
-Do NOT use character-by-character typing unless the website rejects direct fill.
-
-MESSAGE TO ENTER VERBATIM:
----BEGIN MESSAGE---
-${message}
----END MESSAGE---
-
-Original task:
-${instructions}
-
-On your FINAL line, print exactly one of:
-OUTCOME: CONFIRMED — <first 200 chars of visible confirmation>
-OUTCOME: CAPTCHA_BLOCKED — <captcha type>
-OUTCOME: NO_CONFIRMATION — <what the page showed after submit>
-OUTCOME: ERROR — <what went wrong>
-`.trim(),
-        maxSteps: 35,
-      });
-    } else {
-      finalAgentResult = {
-        outcome: "ERROR",
-        message:
-          "Message prefill failed and agent message fallback is disabled or no message was provided.",
-      };
-    }
-
-    const { finalUrl, pageText } = await getFinalPageDetails(page);
+    try {
+      pageText = (await page.locator("body").innerText()).slice(0, 2000);
+    } catch {}
 
     return {
       success: true,
       result: {
-        message: "Stagehand workflow finished",
+        message: "Stagehand agent finished",
         instructionsReceived: instructions,
         urlVisited: targetUrl,
         finalUrl,
         pageText,
-        agentResult: finalAgentResult,
-        preparationResult,
-        initialPrefill,
-        secondPrefill,
-        messagePrefill: successfulPrefill,
+        agentResult,
+        prefill,
         liveSessionUrl: `https://browserbase.com/sessions/${stagehand.browserbaseSessionID}`,
       },
       error: null,
@@ -788,7 +529,7 @@ OUTCOME: ERROR — <what went wrong>
       try {
         await stagehand.close();
       } catch (err) {
-        console.error("Stagehand close failed:", err);
+        console.error("Error closing Stagehand:", err);
       }
     }
   }
@@ -803,7 +544,6 @@ app.post("/run", async (req, res) => {
     callback_url,
     job_id,
     shared_secret,
-    allow_agent_message_typing = true,
   } = req.body || {};
 
   if (!instructions) {
@@ -827,19 +567,16 @@ app.post("/run", async (req, res) => {
         instructions,
         message,
         message_paragraphs,
-        allow_agent_message_typing,
       }),
-      new Promise((resolve) =>
-        setTimeout(
-          () =>
-            resolve({
-              success: false,
-              result: null,
-              error: "render_hard_timeout_4min",
-            }),
-          HARD_TIMEOUT_MS,
-        ),
-      ),
+      new Promise((resolve) => {
+        setTimeout(() => {
+          resolve({
+            success: false,
+            result: null,
+            error: "render_hard_timeout_4min",
+          });
+        }, HARD_TIMEOUT_MS);
+      }),
     ]);
   } catch (err) {
     result = {
@@ -849,112 +586,114 @@ app.post("/run", async (req, res) => {
     };
   }
 
-  if (!callback_url) return;
-
-  let extraction = "";
-
-  if (result.result?.agentResult) {
-    extraction += agentResultToText(result.result.agentResult);
+  if (!callback_url) {
+    return;
   }
 
-  if (result.result?.preparationResult) {
-    extraction += `\n\n[preparation_result]\n${agentResultToText(
-      result.result.preparationResult,
-    )}`;
-  }
+  /*
+    Parse the outcome ONLY from the direct agent result.
 
-  if (result.result?.pageText) {
-    extraction += `\n\n[final_page_text]\n${result.result.pageText}`;
-  }
+    Do NOT parse `extraction`, because it intentionally contains diagnostic
+    content and may include prompt examples such as "OUTCOME: CONFIRMED".
+  */
+  const agentFinalText = agentResultToText(result?.result?.agentResult);
 
-  if (result.result?.finalUrl) {
-    extraction += `\n\n[final_url] ${result.result.finalUrl}`;
-  }
+  const {
+    outcome: trustedOutcome,
+    excerpt: confirmationExcerpt,
+    matchedLine,
+  } = parseTrustedOutcome(agentFinalText);
 
-  for (const key of ["initialPrefill", "secondPrefill", "messagePrefill"]) {
-    const prefill = result.result?.[key];
-    if (!prefill) continue;
+  const extraction = buildExtraction(result);
 
-    extraction += `\n\n[${key}]\n${safeStringify({
-      filled: prefill.filled,
-      locked: prefill.locked,
-      method: prefill.method,
-      source: prefill.source,
-      reason: prefill.reason,
-      selectionReason: prefill.selectionReason,
-      verifiedLength: prefill.verifiedLength,
-      field: prefill.field,
-      inventory: prefill.inventory?.slice(0, 30),
-      attempts: prefill.attempts?.slice(0, 20),
-    })}`;
-  }
+  /*
+    Fail closed:
+    Only a trusted, final `OUTCOME: CONFIRMED` counts as success.
 
-  const { internalOutcome, excerpt } = parseInternalOutcome(extraction);
+    A run that finishes technically (`result.success === true`) is not proof
+    that the form was submitted successfully.
+  */
+  const callbackSuccess = trustedOutcome === "confirmed";
 
-  const binaryResult = buildBinaryResult({
-    internalOutcome,
-    excerpt,
-    resultError: result.error,
-  });
+  const outcome =
+    trustedOutcome ||
+    (result.success ? "no_confirmation" : "error");
+
+  const fallbackExcerpt =
+    trustedOutcome
+      ? confirmationExcerpt
+      : result.error
+        ? String(result.error).slice(0, 300)
+        : "The agent did not provide a trusted final outcome line.";
 
   console.log("[stagehand] run finished", {
     job_id,
-    outcome: binaryResult.outcome,
-    reason: binaryResult.reason,
-    internalOutcome,
+    stagehandRunSuccess: result.success,
+    callbackSuccess,
+    outcome,
+    trustedOutcome,
+    matchedLine,
     error: result.error,
-    messageFilled: result.result?.messagePrefill?.filled || false,
-    messageMethod: result.result?.messagePrefill?.method || null,
+    prefill_filled: result.result?.prefill?.filled,
+    prefill_locked: result.result?.prefill?.locked,
   });
 
   try {
-    const callbackResponse = await fetch(callback_url, {
+    const cbRes = await fetch(callback_url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "x-stagehand-secret":
-          shared_secret || process.env.STAGEHAND_SHARED_SECRET || "",
+          shared_secret ||
+          process.env.STAGEHAND_SHARED_SECRET ||
+          "",
       },
       body: JSON.stringify({
-        /*
-          Lovable should use ONLY this field for the final form status:
-          - SUCCESS: confirmed by visible website evidence
-          - FAILED: every other outcome
-        */
         job_id,
-        outcome: binaryResult.outcome,
 
         /*
-          Controlled reason for your UI, logs, retry rules, or manual review.
+          `success` now strictly means the website visibly confirmed the
+          submission, not merely that the browser agent completed execution.
         */
-        reason: binaryResult.reason,
-        message: binaryResult.message,
-        confirmation_excerpt: binaryResult.confirmationExcerpt,
+        success: callbackSuccess,
+
+        outcome,
+        confirmation_excerpt: fallbackExcerpt,
+
+        trusted_agent_outcome: trustedOutcome || null,
+        trusted_outcome_line: matchedLine || null,
+        agent_final_text: agentFinalText || null,
+
+        extraction,
+
+        prefill: result.result?.prefill
+          ? {
+              filled: result.result.prefill.filled,
+              locked: result.result.prefill.locked,
+              selector: result.result.prefill.selector,
+              reason: result.result.prefill.reason,
+              verifiedLength: result.result.prefill.verifiedLength,
+              usedFallback: result.result.prefill.usedFallback,
+            }
+          : null,
 
         liveSessionUrl: result.result?.liveSessionUrl ?? null,
+        result: result.result,
         error: result.error ?? null,
-
-        /*
-          Diagnostics only. Do not use these to determine form success in Lovable.
-        */
-        internal_outcome: internalOutcome ?? null,
-        extraction,
-        messagePrefill: result.result?.messagePrefill ?? null,
-        initialPrefill: result.result?.initialPrefill ?? null,
-        secondPrefill: result.result?.secondPrefill ?? null,
-        result: result.result ?? null,
       }),
     });
 
     console.log("[stagehand] callback POST", {
       job_id,
-      status: callbackResponse.status,
-      ok: callbackResponse.ok,
+      status: cbRes.status,
+      ok: cbRes.ok,
     });
   } catch (err) {
-    console.error("Callback POST failed:", err);
+    console.error("callback POST failed:", err);
   }
 });
+
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`Stagehand service listening on port ${PORT}`);
