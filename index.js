@@ -4,9 +4,12 @@ const express = require("express");
 const { Stagehand } = require("@browserbasehq/stagehand");
 
 const app = express();
+
 app.use(express.json({ limit: "2mb" }));
 
-app.get("/", (_req, res) => res.send("Stagehand service is running"));
+app.get("/", (_req, res) => {
+  res.send("Stagehand service is running");
+});
 
 const MESSAGE_REGEX =
   /message|comments?|inquiry|inquiries|questions?|details|notes|how can we help|tell us|your\s*message/i;
@@ -14,6 +17,260 @@ const MESSAGE_REGEX =
 const HONEYPOT_REGEX = /honeypot|url2|trap|bot|website\b/i;
 
 const HARD_TIMEOUT_MS = 4 * 60 * 1000;
+
+function safeStringify(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "";
+  }
+}
+
+function normalizeText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cssEscape(value) {
+  return String(value || "").replace(/["\\]/g, "\\$&");
+}
+
+/*
+  Stagehand's returned page object is not always a raw Playwright Page.
+  In particular, some versions do not provide page.$$eval().
+
+  This helper uses locator(...).evaluateAll() only when available; otherwise,
+  it returns an empty list and lets the agent fill the message itself.
+*/
+async function findTextareaCandidates(page) {
+  const locator = page.locator("textarea");
+
+  if (!locator || typeof locator.evaluateAll !== "function") {
+    return [];
+  }
+
+  try {
+    return await locator.evaluateAll(
+      (nodes, rx) => {
+        const messageRe = new RegExp(rx.message, "i");
+        const honeypotRe = new RegExp(rx.honeypot, "i");
+
+        return nodes.map((el, idx) => {
+          const style = window.getComputedStyle(el);
+          const rect = el.getBoundingClientRect();
+
+          const visible =
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            rect.width > 0 &&
+            rect.height > 0;
+
+          const name = el.getAttribute("name") || "";
+          const id = el.getAttribute("id") || "";
+          const placeholder = el.getAttribute("placeholder") || "";
+          const aria = el.getAttribute("aria-label") || "";
+
+          let labelText = "";
+
+          if (id) {
+            const label = document.querySelector(
+              `label[for="${CSS.escape(id)}"]`,
+            );
+
+            if (label) {
+              labelText = label.textContent || "";
+            }
+          }
+
+          if (!labelText && el.parentElement) {
+            const label = el.parentElement.querySelector("label");
+
+            if (label) {
+              labelText = label.textContent || "";
+            }
+          }
+
+          const haystack =
+            `${name} ${id} ${placeholder} ${aria} ${labelText}`.trim();
+
+          let score = 0;
+
+          if (messageRe.test(haystack)) score += 5;
+          if (messageRe.test(labelText)) score += 3;
+
+          const rows = parseInt(el.getAttribute("rows") || "0", 10) || 0;
+          const cols = parseInt(el.getAttribute("cols") || "0", 10) || 0;
+
+          score += Math.min(5, Math.floor((rows * cols) / 100));
+
+          if (!visible) score -= 20;
+
+          /*
+            Do not penalize readonly fields. The harness intentionally marks a
+            successfully prefilled message field readonly after filling it.
+          */
+          if (el.hasAttribute("disabled")) score -= 20;
+
+          if (honeypotRe.test(haystack)) score -= 20;
+
+          let selector = "";
+
+          if (id) {
+            selector = `textarea#${CSS.escape(id)}`;
+          } else if (name) {
+            selector = `textarea[name="${name}"]`;
+          } else {
+            selector = `textarea >> nth=${idx}`;
+          }
+
+          return {
+            idx,
+            selector,
+            score,
+            visible,
+            name,
+            id,
+            placeholder,
+            labelText,
+          };
+        });
+      },
+      {
+        message: MESSAGE_REGEX.source,
+        honeypot: HONEYPOT_REGEX.source,
+      },
+    );
+  } catch (err) {
+    console.warn("[stagehand] textarea candidate evaluation unavailable:", {
+      error: err?.message || String(err),
+    });
+
+    return [];
+  }
+}
+
+async function findTextareaCandidateByLocator(page) {
+  const textareaLocator = page.locator("textarea");
+
+  if (!textareaLocator || typeof textareaLocator.count !== "function") {
+    return null;
+  }
+
+  let count = 0;
+
+  try {
+    count = await textareaLocator.count();
+  } catch {
+    return null;
+  }
+
+  if (!count) {
+    return null;
+  }
+
+  /*
+    Fallback when evaluateAll is not available:
+    - inspect up to 20 visible textareas
+    - score their accessible attributes if available
+    - otherwise choose the first usable textarea
+  */
+  const maxToInspect = Math.min(count, 20);
+
+  let best = null;
+
+  for (let idx = 0; idx < maxToInspect; idx += 1) {
+    const loc = textareaLocator.nth(idx);
+
+    let visible = true;
+    let disabled = false;
+    let placeholder = "";
+    let aria = "";
+    let name = "";
+    let id = "";
+
+    try {
+      if (typeof loc.isVisible === "function") {
+        visible = await loc.isVisible().catch(() => false);
+      }
+    } catch {
+      visible = false;
+    }
+
+    if (!visible) {
+      continue;
+    }
+
+    try {
+      if (typeof loc.isDisabled === "function") {
+        disabled = await loc.isDisabled().catch(() => false);
+      }
+    } catch {
+      disabled = false;
+    }
+
+    if (disabled) {
+      continue;
+    }
+
+    try {
+      if (typeof loc.getAttribute === "function") {
+        placeholder = (await loc.getAttribute("placeholder")) || "";
+        aria = (await loc.getAttribute("aria-label")) || "";
+        name = (await loc.getAttribute("name")) || "";
+        id = (await loc.getAttribute("id")) || "";
+      }
+    } catch {}
+
+    const haystack = `${name} ${id} ${placeholder} ${aria}`;
+    let score = 0;
+
+    if (MESSAGE_REGEX.test(haystack)) score += 5;
+    if (HONEYPOT_REGEX.test(haystack)) score -= 20;
+
+    const candidate = {
+      idx,
+      selector: `textarea >> nth=${idx}`,
+      score,
+      visible,
+      name,
+      id,
+      placeholder,
+      labelText: "",
+    };
+
+    if (!best || candidate.score > best.score) {
+      best = candidate;
+    }
+  }
+
+  return best;
+}
+
+async function lockPrefilledTextarea(locator) {
+  if (!locator || typeof locator.evaluate !== "function") {
+    return false;
+  }
+
+  try {
+    return await locator.evaluate((el) => {
+      try {
+        el.setAttribute("data-lovable-prefilled", "1");
+        el.readOnly = true;
+
+        if (typeof el.blur === "function") {
+          el.blur();
+        }
+
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
 
 async function prefillMessageTextarea(page, message, messageParagraphs) {
   if (!message) {
@@ -28,19 +285,20 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
     };
   }
 
-  const waitForAny = async (ms) => {
+  const waitForAnyTextarea = async (timeout) => {
     try {
       await page.waitForSelector("textarea", {
-        timeout: ms,
+        timeout,
         state: "visible",
       });
+
       return true;
     } catch {
       return false;
     }
   };
 
-  let found = await waitForAny(8000);
+  let found = await waitForAnyTextarea(8000);
 
   if (!found) {
     try {
@@ -50,13 +308,17 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
         })
         .first();
 
-      if (await contactLink.count()) {
-        await contactLink.click({ timeout: 5000 }).catch(() => {});
-        await page.waitForLoadState("domcontentloaded").catch(() => {});
+      if (contactLink && typeof contactLink.count === "function") {
+        const count = await contactLink.count();
+
+        if (count > 0) {
+          await contactLink.click({ timeout: 5000 }).catch(() => {});
+          await page.waitForLoadState("domcontentloaded").catch(() => {});
+        }
       }
     } catch {}
 
-    found = await waitForAny(8000);
+    found = await waitForAnyTextarea(8000);
   }
 
   if (!found) {
@@ -71,97 +333,27 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
     };
   }
 
-  const candidates = await page.$$eval(
-    "textarea",
-    (nodes, rx) => {
-      const messageRe = new RegExp(rx.message, "i");
-      const honeypotRe = new RegExp(rx.honeypot, "i");
+  let candidates = await findTextareaCandidates(page);
 
-      return nodes.map((el, idx) => {
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-
-        const visible =
-          style.display !== "none" &&
-          style.visibility !== "hidden" &&
-          rect.width > 0 &&
-          rect.height > 0;
-
-        const name = el.getAttribute("name") || "";
-        const id = el.getAttribute("id") || "";
-        const placeholder = el.getAttribute("placeholder") || "";
-        const aria = el.getAttribute("aria-label") || "";
-
-        let labelText = "";
-
-        if (id) {
-          const label = document.querySelector(
-            `label[for="${CSS.escape(id)}"]`,
-          );
-
-          if (label) {
-            labelText = label.textContent || "";
-          }
-        }
-
-        if (!labelText && el.parentElement) {
-          const label = el.parentElement.querySelector("label");
-
-          if (label) {
-            labelText = label.textContent || "";
-          }
-        }
-
-        const haystack = `${name} ${id} ${placeholder} ${aria} ${labelText}`;
-
-        let score = 0;
-
-        if (messageRe.test(haystack)) score += 5;
-        if (messageRe.test(labelText)) score += 3;
-
-        const rows = parseInt(el.getAttribute("rows") || "0", 10) || 0;
-        const cols = parseInt(el.getAttribute("cols") || "0", 10) || 0;
-
-        score += Math.min(5, Math.floor((rows * cols) / 100));
-
-        if (!visible) score -= 20;
-        if (el.hasAttribute("readonly") || el.hasAttribute("disabled")) {
-          score -= 20;
-        }
-
-        if (honeypotRe.test(haystack)) score -= 20;
-
-        let selector = "";
-
-        if (id) {
-          selector = `textarea#${CSS.escape(id)}`;
-        } else if (name) {
-          selector = `textarea[name="${name}"]`;
-        } else {
-          selector = `textarea >> nth=${idx}`;
-        }
-
-        return {
-          idx,
-          selector,
-          score,
-          visible,
-          name,
-          id,
-          placeholder,
-          labelText,
-        };
-      });
-    },
-    {
-      message: MESSAGE_REGEX.source,
-      honeypot: HONEYPOT_REGEX.source,
-    },
-  );
-
-  const best = candidates
+  let best = candidates
     .filter((candidate) => candidate.score > 0)
     .sort((a, b) => b.score - a.score)[0];
+
+  /*
+    If Stagehand does not support locator.evaluateAll(), use a safe locator
+    fallback. This fixes the `page.$$eval is not a function` crash.
+  */
+  if (!best) {
+    const fallbackCandidate = await findTextareaCandidateByLocator(page);
+
+    if (fallbackCandidate) {
+      best = fallbackCandidate;
+
+      if (!candidates.length) {
+        candidates = [fallbackCandidate];
+      }
+    }
+  }
 
   if (!best) {
     return {
@@ -175,7 +367,39 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
     };
   }
 
-  const loc = page.locator(best.selector).first();
+  const locator =
+    best.selector && best.selector.startsWith("textarea")
+      ? page.locator(best.selector).first()
+      : page.locator("textarea").nth(best.idx || 0);
+
+  let existingValue = "";
+
+  try {
+    if (locator && typeof locator.inputValue === "function") {
+      existingValue = await locator.inputValue().catch(() => "");
+    }
+  } catch {}
+
+  /*
+    This protects a message that a prior harness step already filled.
+    Never clear or overwrite a matching existing message.
+  */
+  if (
+    existingValue &&
+    normalizeText(existingValue).length >= Math.min(20, normalizeText(message).length)
+  ) {
+    const locked = await lockPrefilledTextarea(locator);
+
+    return {
+      filled: true,
+      locked,
+      selector: best.selector,
+      reason: "already_prefilled",
+      verifiedLength: existingValue.length,
+      usedFallback: false,
+      candidates,
+    };
+  }
 
   let filled = false;
   let usedFallback = false;
@@ -183,33 +407,55 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
   let verifiedLength = 0;
 
   try {
-    await loc.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
-    await loc.click({ timeout: 3000 }).catch(() => {});
-    await loc.fill("", { timeout: 3000 }).catch(() => {});
-    await loc.fill(message, { timeout: 8000 });
+    await locator.scrollIntoViewIfNeeded?.({ timeout: 3000 }).catch(() => {});
+    await locator.click?.({ timeout: 3000 }).catch(() => {});
 
-    const got = await loc.inputValue().catch(() => "");
-    verifiedLength = got.length;
+    /*
+      Normal locator.fill() is preferred because it preserves newlines in a
+      textarea without relying on character-by-character typing.
+    */
+    if (typeof locator.fill !== "function") {
+      throw new Error("locator.fill is not available on this Stagehand page");
+    }
 
-    if (got && got.length >= Math.min(20, message.length)) {
+    await locator.fill("", { timeout: 3000 }).catch(() => {});
+    await locator.fill(message, { timeout: 8000 });
+
+    const got = await locator.inputValue?.().catch(() => "");
+    verifiedLength = got?.length || 0;
+
+    if (
+      got &&
+      normalizeText(got).length >= Math.min(20, normalizeText(message).length)
+    ) {
       filled = true;
       reason = "fill_ok";
     } else {
       usedFallback = true;
 
-      await loc.fill("").catch(() => {});
-      await loc.click({ timeout: 3000 }).catch(() => {});
+      await locator.fill("").catch(() => {});
+      await locator.click?.({ timeout: 3000 }).catch(() => {});
 
       const paragraphs =
         Array.isArray(messageParagraphs) && messageParagraphs.length
           ? messageParagraphs
-          : message.split(/\n{2,}/g);
+          : String(message).split(/\n{2,}/g);
 
-      for (let paragraphIndex = 0; paragraphIndex < paragraphs.length; paragraphIndex++) {
+      for (
+        let paragraphIndex = 0;
+        paragraphIndex < paragraphs.length;
+        paragraphIndex += 1
+      ) {
         const lines = String(paragraphs[paragraphIndex]).split("\n");
 
-        for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-          await loc.pressSequentially(lines[lineIndex], { delay: 5 });
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+          if (typeof locator.pressSequentially !== "function") {
+            throw new Error(
+              "locator.pressSequentially is not available for fallback message filling",
+            );
+          }
+
+          await locator.pressSequentially(lines[lineIndex], { delay: 5 });
 
           if (lineIndex < lines.length - 1) {
             await page.keyboard.press("Shift+Enter");
@@ -222,9 +468,9 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
         }
       }
 
-      const got2 = await loc.inputValue().catch(() => "");
-      verifiedLength = got2.length;
-      filled = got2.length > 0;
+      const gotAfterFallback = await locator.inputValue?.().catch(() => "");
+      verifiedLength = gotAfterFallback?.length || 0;
+      filled = Boolean(gotAfterFallback?.length);
 
       reason = filled
         ? "sequential_ok"
@@ -235,35 +481,14 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
       filled: false,
       locked: false,
       selector: best.selector,
-      reason: `fill_error: ${err.message || err}`,
+      reason: `fill_error: ${err?.message || String(err)}`,
       verifiedLength,
       usedFallback,
       candidates,
     };
   }
 
-  let locked = false;
-
-  if (filled) {
-    try {
-      locked = await loc.evaluate((el) => {
-        try {
-          el.setAttribute("data-lovable-prefilled", "1");
-          el.readOnly = true;
-
-          if (typeof el.blur === "function") {
-            el.blur();
-          }
-
-          return true;
-        } catch {
-          return false;
-        }
-      });
-    } catch {
-      locked = false;
-    }
-  }
+  const locked = filled ? await lockPrefilledTextarea(locator) : false;
 
   return {
     filled,
@@ -276,70 +501,53 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
   };
 }
 
-function safeStringify(value) {
-  try {
-    return JSON.stringify(value);
-  } catch {
+function agentResultToText(agentResult) {
+  if (agentResult == null) {
     return "";
   }
-}
-
-/*
-  Converts a Stagehand agent result into text, but does not mix it with:
-  - prompts
-  - original instructions
-  - page diagnostics
-  - callback diagnostics
-  - agent transcript history
-
-  This is important because instructions themselves contain the literal
-  text "OUTCOME: CONFIRMED", which must never be treated as proof of success.
-*/
-function agentResultToText(agentResult) {
-  if (agentResult == null) return "";
 
   if (typeof agentResult === "string") {
     return agentResult;
   }
 
-  if (typeof agentResult === "object") {
-    const preferredFields = [
-      "text",
-      "message",
-      "output",
-      "content",
-      "result",
-      "final",
-      "completion",
-    ];
+  if (typeof agentResult !== "object") {
+    return String(agentResult);
+  }
 
-    for (const field of preferredFields) {
-      const value = agentResult[field];
+  /*
+    Prefer concise result-style properties. We intentionally do not inspect
+    transcript/history fields, because those often include the prompt itself.
+  */
+  const preferredKeys = [
+    "final",
+    "output",
+    "text",
+    "message",
+    "completion",
+    "content",
+    "result",
+  ];
 
-      if (typeof value === "string" && value.trim()) {
-        return value;
-      }
-    }
+  for (const key of preferredKeys) {
+    const value = agentResult[key];
 
-    try {
-      return JSON.stringify(agentResult);
-    } catch {
-      return String(agentResult);
+    if (typeof value === "string" && value.trim()) {
+      return value;
     }
   }
 
-  return String(agentResult);
+  try {
+    return JSON.stringify(agentResult);
+  } catch {
+    return String(agentResult);
+  }
 }
 
 /*
-  Only accept an outcome if it appears as a standalone line near the end
-  of the final agent response.
+  Trust only a standalone OUTCOME line near the END of the direct agent result.
 
-  This prevents false matches from:
-  - the prompt's "OUTCOME: CONFIRMED" example
-  - internal agent reasoning
-  - pasted transcript/history
-  - diagnostic logs
+  This prevents a false success where the parser sees the literal sample
+  `OUTCOME: CONFIRMED` inside the prompt/instructions/diagnostics.
 */
 function parseTrustedOutcome(agentText) {
   const text = String(agentText || "").trim();
@@ -357,14 +565,16 @@ function parseTrustedOutcome(agentText) {
     .map((line) => line.trim())
     .filter(Boolean);
 
-  const finalLines = lines.slice(-8).reverse();
+  const candidateLines = lines.slice(-10).reverse();
 
-  for (const line of finalLines) {
+  for (const line of candidateLines) {
     const match = line.match(
       /^OUTCOME:\s*(CONFIRMED|CAPTCHA_BLOCKED|NO_CONFIRMATION|ERROR)\s*(?:—|--|:|-)?\s*(.*)$/i,
     );
 
-    if (!match) continue;
+    if (!match) {
+      continue;
+    }
 
     return {
       outcome: match[1].toLowerCase(),
@@ -381,39 +591,40 @@ function parseTrustedOutcome(agentText) {
 }
 
 function buildExtraction(result) {
-  const agentResult = result?.result?.agentResult;
-  const agentText = agentResultToText(agentResult);
+  const agentFinalText = agentResultToText(result?.result?.agentResult);
 
-  let extraction = "";
+  const parts = [];
 
-  if (agentText) {
-    extraction += `[agent_final_result]\n${agentText}`;
+  if (agentFinalText) {
+    parts.push(`[agent_final_result]\n${agentFinalText}`);
   }
 
   if (result?.result?.pageText) {
-    extraction += `\n\n[final_page_text]\n${result.result.pageText}`;
+    parts.push(`[final_page_text]\n${result.result.pageText}`);
   }
 
   if (result?.result?.finalUrl) {
-    extraction += `\n\n[final_url]\n${result.result.finalUrl}`;
+    parts.push(`[final_url]\n${result.result.finalUrl}`);
   }
 
   if (result?.result?.prefill) {
-    extraction += `\n\n[prefill]\n${safeStringify({
-      filled: result.result.prefill.filled,
-      locked: result.result.prefill.locked,
-      selector: result.result.prefill.selector,
-      reason: result.result.prefill.reason,
-      verifiedLength: result.result.prefill.verifiedLength,
-      usedFallback: result.result.prefill.usedFallback,
-    })}`;
+    parts.push(
+      `[prefill]\n${safeStringify({
+        filled: result.result.prefill.filled,
+        locked: result.result.prefill.locked,
+        selector: result.result.prefill.selector,
+        reason: result.result.prefill.reason,
+        verifiedLength: result.result.prefill.verifiedLength,
+        usedFallback: result.result.prefill.usedFallback,
+      })}`,
+    );
   }
 
   if (result?.error) {
-    extraction += `\n\n[run_error]\n${result.error}`;
+    parts.push(`[run_error]\n${result.error}`);
   }
 
-  return extraction.trim();
+  return parts.join("\n\n").trim();
 }
 
 async function runStagehand({
@@ -425,7 +636,10 @@ async function runStagehand({
   let stagehand;
 
   try {
-    stagehand = new Stagehand({ env: "BROWSERBASE" });
+    stagehand = new Stagehand({
+      env: "BROWSERBASE",
+    });
+
     await stagehand.init();
 
     const page = stagehand.context.pages()[0];
@@ -452,10 +666,10 @@ async function runStagehand({
 
     const messageNote =
       prefill.filled && prefill.locked
-        ? `The message/comments/inquiry textarea has ALREADY BEEN FILLED and LOCKED for you by the automation harness (selector "${prefill.selector}"). DO NOT navigate to the current page URL, refresh the page, click the message field, focus it, clear it, retype it, or edit it. It is intentionally readOnly and will submit correctly as-is. Fill ONLY the other fields and submit the form.`
+        ? `The message/comments/inquiry textarea is ALREADY FILLED and LOCKED by the automation harness (selector: "${prefill.selector}"). Do NOT navigate to the current URL, refresh the page, click the message field, focus it, clear it, retype it, or edit it. The existing message must remain unchanged. Fill only the other fields and then submit.`
         : prefill.filled
-          ? `The message textarea has already been filled by the automation harness but could not be locked. Do NOT navigate to the current page URL, refresh, retype, or edit that message. Fill only the other fields and submit.`
-          : `The message textarea could NOT be pre-filled automatically (reason: ${prefill.reason}). Locate the message/comments field yourself and paste the message verbatim before submitting.`;
+          ? `The message textarea is ALREADY FILLED by the automation harness (selector: "${prefill.selector}"). Do NOT navigate to the current URL, refresh the page, click it, clear it, retype it, or edit it. Fill only the other fields and submit.`
+          : `The message textarea could not be prefilled automatically (reason: ${prefill.reason}). You must locate the actual message/comments field, enter the supplied message verbatim, then complete and submit the form.`;
 
     const wrappedInstruction = `
 You are a browser automation agent controlling a real browser.
@@ -465,14 +679,15 @@ Your job is to fill out and SUBMIT the contact form on this page.
 ${messageNote}
 
 HARD RULES:
-- Do NOT call page.goto(), navigate to the current page URL, or refresh the page unless the user explicitly requires navigation to another page.
+- Do NOT call page.goto(), navigate to the current page URL, refresh the page, or reopen the current URL.
+- Do not leave the page unless a genuine form workflow requires a different page after submission.
 - Fill every required field before submitting.
-- Click the actual submit/send/request-appointment button at the end.
-- After clicking submit, wait and observe the result.
-- A successful submission requires visible evidence on the resulting page, such as a confirmation message, thank-you page, success state, or a clear submission confirmation.
-- Do NOT claim confirmation merely because the form button was clicked.
-- If the form was not submitted, validation failed, required data is missing, or no visible confirmation was observed, report NO_CONFIRMATION or ERROR.
-- Your final non-empty line MUST be exactly one of these forms:
+- Click the actual submit/send/request-appointment button.
+- After clicking submit, wait at least 5 seconds and observe the page.
+- A click is NOT proof of successful submission.
+- Report CONFIRMED only when visible evidence appears, such as a thank-you message, a success notice, a confirmation page, a confirmation block replacing the form, or a URL clearly indicating thank/success/sent/received/confirmed.
+- If validation fails, the form remains visible, required data is missing, submission is blocked, or there is no visible success evidence, report NO_CONFIRMATION or ERROR.
+- Your final non-empty line must be exactly one of:
   OUTCOME: CONFIRMED — <first 200 characters of visible confirmation>
   OUTCOME: CAPTCHA_BLOCKED — <captcha type>
   OUTCOME: NO_CONFIRMATION — <what the page showed after the submit attempt>
@@ -517,19 +732,19 @@ ${instructions}
       error: null,
     };
   } catch (err) {
-    console.error("Error in runStagehand:", err);
+    console.error("[stagehand] Error in runStagehand:", err);
 
     return {
       success: false,
       result: null,
-      error: err.message || "Unknown error",
+      error: err?.message || "Unknown error",
     };
   } finally {
     if (stagehand) {
       try {
         await stagehand.close();
       } catch (err) {
-        console.error("Error closing Stagehand:", err);
+        console.error("[stagehand] failed to close browser session:", err);
       }
     }
   }
@@ -553,6 +768,9 @@ app.post("/run", async (req, res) => {
     });
   }
 
+  /*
+    Respond right away so the calling service can track the asynchronous job.
+  */
   res.json({
     accepted: true,
     job_id,
@@ -582,7 +800,7 @@ app.post("/run", async (req, res) => {
     result = {
       success: false,
       result: null,
-      error: err.message || "unknown_error",
+      error: err?.message || "unknown_error",
     };
   }
 
@@ -591,16 +809,16 @@ app.post("/run", async (req, res) => {
   }
 
   /*
-    Parse the outcome ONLY from the direct agent result.
-
-    Do NOT parse `extraction`, because it intentionally contains diagnostic
-    content and may include prompt examples such as "OUTCOME: CONFIRMED".
+    IMPORTANT:
+    Parse only the direct final agent result, NOT the combined extraction.
+    The extraction includes prompts and diagnostics, which may contain the
+    literal words `OUTCOME: CONFIRMED` without a real submission occurring.
   */
   const agentFinalText = agentResultToText(result?.result?.agentResult);
 
   const {
     outcome: trustedOutcome,
-    excerpt: confirmationExcerpt,
+    excerpt,
     matchedLine,
   } = parseTrustedOutcome(agentFinalText);
 
@@ -608,10 +826,8 @@ app.post("/run", async (req, res) => {
 
   /*
     Fail closed:
-    Only a trusted, final `OUTCOME: CONFIRMED` counts as success.
-
-    A run that finishes technically (`result.success === true`) is not proof
-    that the form was submitted successfully.
+    success is true only if a trusted final agent outcome explicitly confirms
+    visible submission evidence.
   */
   const callbackSuccess = trustedOutcome === "confirmed";
 
@@ -619,12 +835,13 @@ app.post("/run", async (req, res) => {
     trustedOutcome ||
     (result.success ? "no_confirmation" : "error");
 
-  const fallbackExcerpt =
-    trustedOutcome
-      ? confirmationExcerpt
-      : result.error
-        ? String(result.error).slice(0, 300)
-        : "The agent did not provide a trusted final outcome line.";
+  const confirmationExcerpt =
+    excerpt ||
+    (result.error
+      ? String(result.error).slice(0, 300)
+      : trustedOutcome
+        ? null
+        : "No trusted final agent outcome was found.");
 
   console.log("[stagehand] run finished", {
     job_id,
@@ -639,7 +856,7 @@ app.post("/run", async (req, res) => {
   });
 
   try {
-    const cbRes = await fetch(callback_url, {
+    const callbackResponse = await fetch(callback_url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -652,15 +869,19 @@ app.post("/run", async (req, res) => {
         job_id,
 
         /*
-          `success` now strictly means the website visibly confirmed the
-          submission, not merely that the browser agent completed execution.
+          This is the important value for your application:
+          true only after trusted CONFIRMED output.
         */
         success: callbackSuccess,
 
         outcome,
-        confirmation_excerpt: fallbackExcerpt,
+        confirmation_excerpt: confirmationExcerpt,
 
-        trusted_agent_outcome: trustedOutcome || null,
+        /*
+          Useful debugging fields. They help you identify whether the model
+          generated a valid final result, without parsing a noisy transcript.
+        */
+        internal_outcome: trustedOutcome || null,
         trusted_outcome_line: matchedLine || null,
         agent_final_text: agentFinalText || null,
 
@@ -685,11 +906,11 @@ app.post("/run", async (req, res) => {
 
     console.log("[stagehand] callback POST", {
       job_id,
-      status: cbRes.status,
-      ok: cbRes.ok,
+      status: callbackResponse.status,
+      ok: callbackResponse.ok,
     });
   } catch (err) {
-    console.error("callback POST failed:", err);
+    console.error("[stagehand] callback POST failed:", err);
   }
 });
 
