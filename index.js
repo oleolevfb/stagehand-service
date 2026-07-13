@@ -84,7 +84,9 @@ async function clickLikelyContactLink(page) {
     if (!(await contactLink.count())) return false;
 
     await contactLink.click({ timeout: 5000 }).catch(() => {});
-    await page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+    await page
+      .waitForLoadState("domcontentloaded", { timeout: 8000 })
+      .catch(() => {});
     await sleep(1000);
 
     return true;
@@ -142,6 +144,7 @@ async function inspectMainDocumentFields(page) {
           }
 
           let describedByText = "";
+
           for (const describedId of ariaDescribedBy.split(/\s+/).filter(Boolean)) {
             const description = document.getElementById(describedId);
             if (description) {
@@ -227,7 +230,11 @@ async function inspectMainDocumentFields(page) {
 
     return Array.isArray(fields) ? fields : [];
   } catch (err) {
-    console.error("[stagehand] main-document field inspection failed:", err.message || err);
+    console.error(
+      "[stagehand] main-document field inspection failed:",
+      err.message || err,
+    );
+
     return [];
   }
 }
@@ -261,7 +268,7 @@ async function tryFillLocator(locator, message, source) {
 
   try {
     await locator.scrollTo({ timeout: 5000 }).catch(() => {});
-    await locator.fill(message, { timeout: 12_000 });
+    await locator.fill(message, { timeout: 12000 });
 
     const value = await locator.inputValue().catch(() => "");
 
@@ -475,19 +482,34 @@ async function directFillMessage(page, message, waitMs) {
   };
 }
 
-function parseOutcome(text) {
-  if (!text) return { outcome: undefined, excerpt: null };
+/*
+  Internal statuses remain detailed so the code can distinguish:
+  confirmed, captcha_blocked, no_confirmation, agent error, etc.
+
+  Lovable receives only:
+  outcome: SUCCESS | FAILED
+*/
+function parseInternalOutcome(text) {
+  if (!text) {
+    return {
+      internalOutcome: undefined,
+      excerpt: null,
+    };
+  }
 
   const match = String(text).match(
     /OUTCOME:\s*(CONFIRMED|CAPTCHA_BLOCKED|READY_FOR_MESSAGE|NO_CONFIRMATION|ERROR)\s*[—:-]?\s*(.{0,500})?/i,
   );
 
   if (!match) {
-    return { outcome: undefined, excerpt: null };
+    return {
+      internalOutcome: undefined,
+      excerpt: null,
+    };
   }
 
   return {
-    outcome: match[1].toLowerCase(),
+    internalOutcome: match[1].toLowerCase(),
     excerpt: (match[2] || "").trim().slice(0, 300) || null,
   };
 }
@@ -506,6 +528,57 @@ function agentResultToText(agentResult) {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function buildBinaryResult({ internalOutcome, excerpt, resultError }) {
+  const confirmed = internalOutcome === "confirmed";
+
+  if (confirmed) {
+    return {
+      outcome: "SUCCESS",
+      reason: "confirmed",
+      message:
+        excerpt ||
+        "The website displayed a submission confirmation.",
+      confirmationExcerpt: excerpt || null,
+    };
+  }
+
+  if (resultError === "render_hard_timeout_4min") {
+    return {
+      outcome: "FAILED",
+      reason: "timeout",
+      message: "The browser workflow exceeded the 4-minute time limit.",
+      confirmationExcerpt: null,
+    };
+  }
+
+  const reasonMap = {
+    captcha_blocked: "captcha_blocked",
+    no_confirmation: "no_confirmation",
+    error: "agent_error",
+    ready_for_message: "message_fill_failed",
+  };
+
+  const reason = reasonMap[internalOutcome] || "unknown";
+
+  const defaultMessages = {
+    captcha_blocked: "The form could not be submitted because a CAPTCHA blocked progress.",
+    no_confirmation:
+      "The form may have been submitted, but no visible confirmation could be verified.",
+    agent_error: "The browser agent reported an error while completing the form.",
+    message_fill_failed:
+      "The form was prepared, but the message field could not be completed.",
+    unknown:
+      "The submission could not be verified as successful.",
+  };
+
+  return {
+    outcome: "FAILED",
+    reason,
+    message: excerpt || resultError || defaultMessages[reason],
+    confirmationExcerpt: null,
+  };
 }
 
 async function getFinalPageDetails(page) {
@@ -540,13 +613,11 @@ async function runStagehand({
     const targetUrl = url || "https://example.com";
 
     await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForLoadState("networkidle", { timeout: 10_000 }).catch(() => {});
+    await page
+      .waitForLoadState("networkidle", { timeout: 10000 })
+      .catch(() => {});
     await sleep(800);
 
-    /*
-      PHASE 1:
-      Attempt a fast deterministic fill before the agent does anything.
-    */
     const initialPrefill = await directFillMessage(
       page,
       message,
@@ -572,11 +643,6 @@ async function runStagehand({
     let secondPrefill = null;
     let finalAgentResult = null;
 
-    /*
-      PHASE 2:
-      Only when the initial fill fails, prepare the form without submitting.
-      This is temporary: later branches ALWAYS submit.
-    */
     if (message && !initialPrefill.filled) {
       preparationResult = await agent.execute({
         instruction: `
@@ -604,10 +670,6 @@ ${instructions}
         maxSteps: 28,
       });
 
-      /*
-        PHASE 3:
-        Now the form should be fully open. Try direct fill again.
-      */
       secondPrefill = await directFillMessage(
         page,
         message,
@@ -628,13 +690,6 @@ ${instructions}
         ? secondPrefill
         : null;
 
-    /*
-      PHASE 4:
-      Every normal path now submits the form.
-
-      If direct prefill worked, agent submits only.
-      If direct prefill failed, agent receives the message and completes/submits.
-    */
     if (successfulPrefill) {
       finalAgentResult = await agent.execute({
         instruction: `
@@ -653,7 +708,7 @@ Your task:
 5. If a CAPTCHA is shown, wait briefly for configured browser handling. If it remains unresolved, report it.
 
 On your FINAL line, print exactly one of:
-OUTCOME: CONFIRMED — <first 200 chars of confirmation>
+OUTCOME: CONFIRMED — <first 200 chars of visible confirmation>
 OUTCOME: CAPTCHA_BLOCKED — <captcha type>
 OUTCOME: NO_CONFIRMATION — <what the page showed after submit>
 OUTCOME: ERROR — <what went wrong>
@@ -661,12 +716,6 @@ OUTCOME: ERROR — <what went wrong>
         maxSteps: 20,
       });
     } else if (message && allow_agent_message_typing) {
-      /*
-        This is now the DEFAULT fallback.
-
-        The agent receives the message only after both deterministic fill attempts
-        fail. It is explicitly instructed to complete and submit the form.
-      */
       finalAgentResult = await agent.execute({
         instruction: `
 Complete and SUBMIT the contact form in the real browser.
@@ -692,7 +741,7 @@ Original task:
 ${instructions}
 
 On your FINAL line, print exactly one of:
-OUTCOME: CONFIRMED — <first 200 chars of confirmation>
+OUTCOME: CONFIRMED — <first 200 chars of visible confirmation>
 OUTCOME: CAPTCHA_BLOCKED — <captcha type>
 OUTCOME: NO_CONFIRMATION — <what the page showed after submit>
 OUTCOME: ERROR — <what went wrong>
@@ -700,10 +749,6 @@ OUTCOME: ERROR — <what went wrong>
         maxSteps: 35,
       });
     } else {
-      /*
-        This can only happen when no message exists or agent fallback has been
-        deliberately disabled in the request.
-      */
       finalAgentResult = {
         outcome: "ERROR",
         message:
@@ -768,7 +813,10 @@ app.post("/run", async (req, res) => {
     });
   }
 
-  res.json({ accepted: true, job_id });
+  res.json({
+    accepted: true,
+    job_id,
+  });
 
   let result;
 
@@ -841,20 +889,22 @@ app.post("/run", async (req, res) => {
     })}`;
   }
 
-  const { outcome, excerpt } = parseOutcome(extraction);
-  const messagePrefill = result.result?.messagePrefill || null;
+  const { internalOutcome, excerpt } = parseInternalOutcome(extraction);
 
-  const success =
-    outcome === "confirmed" ||
-    (outcome === undefined && result.success);
+  const binaryResult = buildBinaryResult({
+    internalOutcome,
+    excerpt,
+    resultError: result.error,
+  });
 
   console.log("[stagehand] run finished", {
     job_id,
-    success,
-    outcome,
+    outcome: binaryResult.outcome,
+    reason: binaryResult.reason,
+    internalOutcome,
     error: result.error,
-    messageFilled: messagePrefill?.filled || false,
-    messageMethod: messagePrefill?.method || null,
+    messageFilled: result.result?.messagePrefill?.filled || false,
+    messageMethod: result.result?.messagePrefill?.method || null,
   });
 
   try {
@@ -866,17 +916,33 @@ app.post("/run", async (req, res) => {
           shared_secret || process.env.STAGEHAND_SHARED_SECRET || "",
       },
       body: JSON.stringify({
+        /*
+          Lovable should use ONLY this field for the final form status:
+          - SUCCESS: confirmed by visible website evidence
+          - FAILED: every other outcome
+        */
         job_id,
-        success,
-        outcome,
-        confirmation_excerpt: excerpt,
+        outcome: binaryResult.outcome,
+
+        /*
+          Controlled reason for your UI, logs, retry rules, or manual review.
+        */
+        reason: binaryResult.reason,
+        message: binaryResult.message,
+        confirmation_excerpt: binaryResult.confirmationExcerpt,
+
+        liveSessionUrl: result.result?.liveSessionUrl ?? null,
+        error: result.error ?? null,
+
+        /*
+          Diagnostics only. Do not use these to determine form success in Lovable.
+        */
+        internal_outcome: internalOutcome ?? null,
         extraction,
-        messagePrefill,
-        initialPrefill: result.result?.initialPrefill || null,
-        secondPrefill: result.result?.secondPrefill || null,
-        liveSessionUrl: result.result?.liveSessionUrl || null,
-        result: result.result,
-        error: result.error || null,
+        messagePrefill: result.result?.messagePrefill ?? null,
+        initialPrefill: result.result?.initialPrefill ?? null,
+        secondPrefill: result.result?.secondPrefill ?? null,
+        result: result.result ?? null,
       }),
     });
 
