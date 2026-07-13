@@ -16,7 +16,7 @@ const MESSAGE_REGEX =
 
 const HONEYPOT_REGEX = /honeypot|url2|trap|bot|website\b/i;
 
-const HARD_TIMEOUT_MS = 4 * 60 * 1000;
+const HARD_TIMEOUT_MS = 6 * 60 * 1000;
 
 function safeStringify(value) {
   try {
