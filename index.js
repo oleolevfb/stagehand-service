@@ -703,7 +703,7 @@ ${instructions}
 
     const agentResult = await agent.execute({
       instruction: wrappedInstruction,
-      maxSteps: 35,
+      maxSteps: 40,
     });
 
     let finalUrl = "";
