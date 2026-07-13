@@ -1,3 +1,5 @@
+
+
 require("dotenv").config();
 
 const express = require("express");
@@ -669,7 +671,8 @@ async function runStagehand({
         ? `The message/comments/inquiry textarea is ALREADY FILLED and LOCKED by the automation harness (selector: "${prefill.selector}"). Do NOT navigate to the current URL, refresh the page, click the message field, focus it, clear it, retype it, or edit it. The existing message must remain unchanged. Fill only the other fields and then submit.`
         : prefill.filled
           ? `The message textarea is ALREADY FILLED by the automation harness (selector: "${prefill.selector}"). Do NOT navigate to the current URL, refresh the page, click it, clear it, retype it, or edit it. Fill only the other fields and submit.`
-          : `The message textarea could not be prefilled automatically (reason: ${prefill.reason}). You must locate the actual message/comments field, enter the supplied message verbatim, then complete and submit the form.`;
+          : `The message textarea could not be prefilled automatically (reason: ${prefill.reason}). Youu must locate the correct textarea and insert the entire message in a single operation (e.g. using fill/paste), NOT by typing character-by-character, unless a prior attempt to fill/paste fails, then complete and submit the form.`;
+		  
 
     const wrappedInstruction = `
 You are a browser automation agent controlling a real browser.
