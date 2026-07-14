@@ -16,7 +16,7 @@ const MESSAGE_REGEX =
 
 const HONEYPOT_REGEX = /honeypot|url2|trap|bot|website\b/i;
 
-const HARD_TIMEOUT_MS = 5 * 60 * 1000;
+const HARD_TIMEOUT_MS = 4 * 60 * 1000;
 
 function safeStringify(value) {
   try {
@@ -121,8 +121,7 @@ async function findTextareaCandidates(page) {
           } else if (name) {
             selector = `textarea[name="${name}"]`;
           } else {
-            // We will not feed a "nth" selector string back into page.locator;
-            // idx will be used with locator().nth() instead.
+            // leave selector empty; we will use idx with .nth() later
             selector = "";
           }
 
@@ -232,9 +231,7 @@ async function findTextareaCandidateByLocator(page) {
 
     const candidate = {
       idx,
-      // Important: do NOT encode "textarea >> nth=idx" as a selector string,
-      // as Stagehand fails to resolve that. We'll use idx with .nth() later.
-      selector: "",
+      selector: "", // don't encode 'textarea >> nth=idx'
       score,
       visible,
       name,
@@ -403,7 +400,10 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
   */
   if (
     existingValue &&
-    normalizeText(existingValue).length >= Math.min(20, normalizeText(message).length)
+    normalizeText(existingValue).length >= Math.min(
+      20,
+      normalizeText(message).length,
+    )
   ) {
     const locked = await lockPrefilledTextarea(locator);
 
@@ -515,7 +515,6 @@ function agentResultToText(agentResult) {
     return String(agentResult);
   }
 }
-
 /*
   Trust only a standalone OUTCOME line near the END of the direct agent result.
 
@@ -805,20 +804,4 @@ app.post("/run", async (req, res) => {
   const callbackSuccess = trustedOutcome === "confirmed";
 
   const outcome =
-    trustedOutcome ||
-    (result.success ? "no_confirmation" : "error");
-
-  const confirmationExcerpt =
-    excerpt ||
-    (result.error
-      ? String(result.error).slice(0, 300)
-      : trustedOutcome
-        ? null
-        : "No trusted final agent outcome was found.");
-
-  console.log("[stagehand] run finished", {
-    job_id,
-    stagehandRunSuccess: result.success,
-    callbackSuccess,
-    outcome,
-   
+    trusted
