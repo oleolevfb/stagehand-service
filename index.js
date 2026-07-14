@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express");
@@ -16,7 +17,7 @@ const MESSAGE_REGEX =
 
 const HONEYPOT_REGEX = /honeypot|url2|trap|bot|website\b/i;
 
-const HARD_TIMEOUT_MS = 4 * 60 * 1000;
+const HARD_TIMEOUT_MS = 5 * 60 * 1000;
 
 function safeStringify(value) {
   try {
@@ -121,8 +122,7 @@ async function findTextareaCandidates(page) {
           } else if (name) {
             selector = `textarea[name="${name}"]`;
           } else {
-            // leave selector empty; we will use idx with .nth() later
-            selector = "";
+            selector = `textarea >> nth=${idx}`;
           }
 
           return {
@@ -170,12 +170,6 @@ async function findTextareaCandidateByLocator(page) {
     return null;
   }
 
-  /*
-    Fallback when evaluateAll is not available:
-    - inspect up to 20 visible textareas
-    - score their accessible attributes if available
-    - otherwise choose the first usable textarea
-  */
   const maxToInspect = Math.min(count, 20);
 
   let best = null;
@@ -231,7 +225,8 @@ async function findTextareaCandidateByLocator(page) {
 
     const candidate = {
       idx,
-      selector: "", // don't encode 'textarea >> nth=idx'
+      // DO NOT encode "textarea >> nth=idx" here; we'll use idx with .nth() later
+      selector: "",
       score,
       visible,
       name,
@@ -247,6 +242,7 @@ async function findTextareaCandidateByLocator(page) {
 
   return best;
 }
+
 
 async function lockPrefilledTextarea(locator) {
   if (!locator || typeof locator.evaluate !== "function") {
@@ -368,23 +364,20 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
     };
   }
 
-  // Build a locator in a way that Stagehand supports:
-  // 1. Prefer id
-  // 2. Then name
-  // 3. Finally fall back to nth(idx)
-  let locator;
-  let selector = null;
+// Build a locator in a way that Stagehand supports:
+// 1. Prefer id
+// 2. Then name
+// 3. Finally fall back to nth(idx)
+let locator;
 
-  if (best.id) {
-    selector = `textarea#${cssEscape(best.id)}`;
-    locator = page.locator(selector);
-  } else if (best.name) {
-    selector = `textarea[name="${best.name}"]`;
-    locator = page.locator(selector);
-  } else {
-    locator = page.locator("textarea").nth(best.idx || 0);
-    selector = `textarea[nth=${best.idx || 0}]`;
-  }
+if (best.id) {
+  locator = page.locator(`textarea#${cssEscape(best.id)}`);
+} else if (best.name) {
+  locator = page.locator(`textarea[name="${best.name}"]`);
+} else {
+  locator = page.locator("textarea").nth(best.idx || 0);
+}
+
 
   let existingValue = "";
 
@@ -400,17 +393,14 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
   */
   if (
     existingValue &&
-    normalizeText(existingValue).length >= Math.min(
-      20,
-      normalizeText(message).length,
-    )
+    normalizeText(existingValue).length >= Math.min(20, normalizeText(message).length)
   ) {
     const locked = await lockPrefilledTextarea(locator);
 
     return {
       filled: true,
       locked,
-      selector,
+      selector: best.selector,
       reason: "already_prefilled",
       verifiedLength: existingValue.length,
       usedFallback: false,
@@ -426,6 +416,8 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
   try {
     await locator.scrollIntoViewIfNeeded?.({ timeout: 3000 }).catch(() => {});
     await locator.click?.({ timeout: 3000 }).catch(() => {});
+
+
 
     /*
       Normal locator.fill() is preferred because it preserves newlines in a
@@ -449,11 +441,15 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
       usedFallback = false;
       reason = "fill_failed_no_fallback";
     }
+
+
+
+
   } catch (err) {
     return {
       filled: false,
       locked: false,
-      selector,
+      selector: best.selector,
       reason: `fill_error: ${err?.message || String(err)}`,
       verifiedLength,
       usedFallback,
@@ -466,7 +462,7 @@ async function prefillMessageTextarea(page, message, messageParagraphs) {
   return {
     filled,
     locked,
-    selector,
+    selector: best.selector,
     reason,
     verifiedLength,
     usedFallback,
@@ -515,6 +511,7 @@ function agentResultToText(agentResult) {
     return String(agentResult);
   }
 }
+
 /*
   Trust only a standalone OUTCOME line near the END of the direct agent result.
 
@@ -641,7 +638,8 @@ async function runStagehand({
         ? `The message/comments/inquiry textarea is ALREADY FILLED and LOCKED by the automation harness (selector: "${prefill.selector}"). Do NOT navigate to the current URL, refresh the page, click the message field, focus it, clear it, retype it, or edit it. The existing message must remain unchanged. Fill only the other fields and then submit.`
         : prefill.filled
           ? `The message textarea is ALREADY FILLED by the automation harness (selector: "${prefill.selector}"). Do NOT navigate to the current URL, refresh the page, click it, clear it, retype it, or edit it. Fill only the other fields and submit.`
-          : `The message textarea could not be prefilled automatically (reason: ${prefill.reason}). You must locate the correct textarea and insert the entire message in a single operation (e.g. using fill/paste), NOT by typing character-by-character, unless a prior attempt to fill/paste fails, then complete and submit the form.`;
+          : `The message textarea could not be prefilled automatically (reason: ${prefill.reason}). Youu must locate the correct textarea and insert the entire message in a single operation (e.g. using fill/paste), NOT by typing character-by-character, unless a prior attempt to fill/paste fails, then complete and submit the form.`;
+		  
 
     const wrappedInstruction = `
 You are a browser automation agent controlling a real browser.
@@ -804,4 +802,90 @@ app.post("/run", async (req, res) => {
   const callbackSuccess = trustedOutcome === "confirmed";
 
   const outcome =
-    trusted
+    trustedOutcome ||
+    (result.success ? "no_confirmation" : "error");
+
+  const confirmationExcerpt =
+    excerpt ||
+    (result.error
+      ? String(result.error).slice(0, 300)
+      : trustedOutcome
+        ? null
+        : "No trusted final agent outcome was found.");
+
+  console.log("[stagehand] run finished", {
+    job_id,
+    stagehandRunSuccess: result.success,
+    callbackSuccess,
+    outcome,
+    trustedOutcome,
+    matchedLine,
+    error: result.error,
+    prefill_filled: result.result?.prefill?.filled,
+    prefill_locked: result.result?.prefill?.locked,
+  });
+
+  try {
+    const callbackResponse = await fetch(callback_url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-stagehand-secret":
+          shared_secret ||
+          process.env.STAGEHAND_SHARED_SECRET ||
+          "",
+      },
+      body: JSON.stringify({
+        job_id,
+
+        /*
+          This is the important value for your application:
+          true only after trusted CONFIRMED output.
+        */
+        success: callbackSuccess,
+
+        outcome,
+        confirmation_excerpt: confirmationExcerpt,
+
+        /*
+          Useful debugging fields. They help you identify whether the model
+          generated a valid final result, without parsing a noisy transcript.
+        */
+        internal_outcome: trustedOutcome || null,
+        trusted_outcome_line: matchedLine || null,
+        agent_final_text: agentFinalText || null,
+
+        extraction,
+
+        prefill: result.result?.prefill
+          ? {
+              filled: result.result.prefill.filled,
+              locked: result.result.prefill.locked,
+              selector: result.result.prefill.selector,
+              reason: result.result.prefill.reason,
+              verifiedLength: result.result.prefill.verifiedLength,
+              usedFallback: result.result.prefill.usedFallback,
+            }
+          : null,
+
+        liveSessionUrl: result.result?.liveSessionUrl ?? null,
+        result: result.result,
+        error: result.error ?? null,
+      }),
+    });
+
+    console.log("[stagehand] callback POST", {
+      job_id,
+      status: callbackResponse.status,
+      ok: callbackResponse.ok,
+    });
+  } catch (err) {
+    console.error("[stagehand] callback POST failed:", err);
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Stagehand service listening on port ${PORT}`);
+});
